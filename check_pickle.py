@@ -3,6 +3,8 @@ import pickle
 import sys
 import os
 
+BASE = os.path.dirname(os.path.abspath(__file__))
+
 def check(path):
     print(f"Checking {path} ({os.path.getsize(path)} bytes)...")
     try:
@@ -23,5 +25,12 @@ def check(path):
     except Exception as e:
         print(f"Error: {e}")
 
-check(r"d:\code\trifeet\checkpoints_async\replay_buffer.pkl")
-check(r"d:\code\trifeet\backup\checkpoints_async\replay_buffer.pkl")
+paths = [
+    os.path.join(BASE, "checkpoints_async", "replay_buffer.pkl"),
+    os.path.join(BASE, "checkpoints", "replay_buffer.pkl"),
+]
+for p in paths:
+    if os.path.exists(p):
+        check(p)
+    else:
+        print(f"Skipped (not found): {p}")

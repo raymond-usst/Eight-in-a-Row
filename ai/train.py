@@ -383,8 +383,12 @@ def train(config: MuZeroConfig, args):
             current_batch_size = int(getattr(config, 'batch_size_start', 128) + (getattr(config, 'batch_size_end', 1024) - getattr(config, 'batch_size_start', 128)) * progress)
             
             batch = replay_buffer.sample_batch(
-                current_batch_size, config.num_unroll_steps,
-                config.td_steps, config.discount, config.policy_size
+                batch_size=current_batch_size,
+                num_unroll_steps=config.num_unroll_steps,
+                td_steps=config.td_steps,
+                discount=config.discount,
+                action_size=config.policy_size,
+                view_size=config.local_view_size
             )
             if getattr(config, 'augment_board', False):
                 apply_board_augment(batch, np.random.default_rng(), noise_std=getattr(config, 'augment_noise_std', 0.0) or None)
@@ -414,7 +418,7 @@ def train(config: MuZeroConfig, args):
         
         curriculum.record_loss(avg_loss)
         
-        if curriculum.check_graduation(league=league):
+        if curriculum.check_graduation(step=global_step, league=league):
             stage = curriculum.advance(league=league)
             if stage:
                 broadcast('curriculum_graduation', {'stage_id': stage.stage_id, 'stage': str(stage)})
@@ -478,10 +482,7 @@ def _update_memory_bank(memory_bank, game, network, device, config):
         if i in indices:
             ctr = game.centers[i]
             rotated = env._get_rotated_planes_cached()
-            legal = env.legal_moves_local(ctr[0], ctr[1], config.local_view_size)
-            legal_mask = np.zeros(config.policy_size, dtype=np.float32)
-            for lr, lc in legal:
-                legal_mask[lr * config.local_view_size + lc] = 1.0
+            _, legal_mask = env.get_legal_moves_and_mask(ctr[0], ctr[1], config.local_view_size)
             obs, _, _ = _get_observation_and_mask(env, config, ctr[0], ctr[1], legal_mask, rotated)
             obs_dict[i] = obs
             

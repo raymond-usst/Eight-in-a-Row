@@ -244,8 +244,11 @@ class ReplayBuffer:
                 sample_idx = np.linspace(0, game_len - 1, min(5, game_len), dtype=int)
                 entropies = []
                 for i in sample_idx:
-                    p = np.clip(game.policy_targets[i], 1e-8, 1.0)
-                    entropies.append(-np.sum(p * np.log(p)))
+                    p = np.asarray(game.policy_targets[i], dtype=np.float64)
+                    p = np.nan_to_num(p, nan=1e-12, posinf=1.0, neginf=1e-12)
+                    p = np.clip(p, 1e-12, 1.0)
+                    # Only compute entropy for p > 0 to avoid log(0) / NaN warnings
+                    entropies.append(-np.sum(np.where(p > 0, p * np.log(p), 0.0)))
                 avg_entropy = np.mean(entropies)
                 max_entropy = np.log(len(game.policy_targets[0]))  # log(441) ≈ 6.09
                 sharpness_s = max(0.0, 1.0 - avg_entropy / max_entropy) if max_entropy > 0 else 0.5
@@ -534,7 +537,7 @@ class ReplayBuffer:
 
     def sample_batch(self, batch_size: int, num_unroll_steps: int,
                      td_steps: int, discount: float,
-                     action_size: int) -> Dict[str, np.ndarray]:
+                     action_size: int, view_size: int = 21) -> Dict[str, np.ndarray]:
         """
         Sample a batch of positions with prioritized experience replay.
         """
@@ -632,7 +635,7 @@ class ReplayBuffer:
 
             # --- Focus Network Data (sparse snapshot + short replay) ---
             BOARD_SIZE = getattr(game, 'board_size', 100)
-            VIEW_SIZE = 21
+            VIEW_SIZE = view_size
             HALF = VIEW_SIZE // 2
             
             # Find nearest precomputed snapshot and replay at most ~SNAP_INTERVAL steps
@@ -696,7 +699,7 @@ class ReplayBuffer:
             
             # Global thumbnail
             rot_stack = np.stack([rotated_planes[1], rotated_planes[2], rotated_planes[3], rotated_planes[0]], axis=0).astype(np.float32)
-            obs_global = self._obs_env._numpy_area_pool(rot_stack)
+            obs_global = self._obs_env._numpy_area_pool(rot_stack, VIEW_SIZE)
             obs_array = np.concatenate([obs_local, obs_global], axis=0)
             
             # Replace the dummy None we pushed earlier
@@ -739,7 +742,7 @@ class ReplayBuffer:
                 obs_local_next = np.stack(chans_n, axis=0).astype(np.float32)
                 
                 rot_stack_next = np.stack([rotated_planes_next[1], rotated_planes_next[2], rotated_planes_next[3], rotated_planes_next[0]], axis=0).astype(np.float32)
-                obs_global_next = self._obs_env._numpy_area_pool(rot_stack_next)
+                obs_global_next = self._obs_env._numpy_area_pool(rot_stack_next, VIEW_SIZE)
                 obs_next_array = np.concatenate([obs_local_next, obs_global_next], axis=0)
                 
                 batch_next_obs[-1] = obs_next_array

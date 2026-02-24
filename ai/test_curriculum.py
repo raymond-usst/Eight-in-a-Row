@@ -59,7 +59,7 @@ def test_curriculum_stage(stage, expected_size, expected_win):
     # 5. Replay Buffer
     buffer = ReplayBuffer(max_size=100)
     buffer.save_game(game)
-    assert len(buffer.games) == 1
+    assert len(buffer.meta) == 1
     
     # Sample batch
     action_size = expected_size * expected_size

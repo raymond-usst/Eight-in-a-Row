@@ -457,28 +457,28 @@ class EightInARowEnv:
         self._cached_rotated_player = self.current_player
         return self._cached_rotated
 
-    def _numpy_area_pool(self, planes: np.ndarray) -> np.ndarray:
-        """Pure-numpy area interpolation (4, Size, Size) → (4, 21, 21)."""
-        target_size = 21
-        
-        # If board is smaller than target, just pad it
+    def _numpy_area_pool(self, planes: np.ndarray, target_size: int) -> np.ndarray:
+        """Pure-numpy area interpolation."""
         if self.BOARD_SIZE < target_size:
             _, h, w = planes.shape
             pad_h = target_size - h
             pad_w = target_size - w
-            # Pad at end (bottom/right) or center? 
-            # get_observation does top-left/center crop.
-            # Local view pads bottom/right in my previous fix. 
-            # Let's simple pad bottom/right to match "it fits in the corner" or center it?
-            # Creating a thumbnail of a small board: usually we just want to see the board.
-            # Padding bottom/right is safest to keep coordinate alignment simple if 0,0 is 0,0.
             return np.pad(planes, ((0, 0), (0, pad_h), (0, pad_w)), mode='constant', constant_values=0)
 
-        # Use np.add.reduceat for fast binned summation along each axis
-        # Sum along rows first, then columns
-        row_sums = np.add.reduceat(planes, self._pool_rows[:-1], axis=1)  # (4, 21, Size)
-        bin_sums = np.add.reduceat(row_sums, self._pool_cols[:-1], axis=2)  # (4, 21, 21)
-        return bin_sums / self._pool_areas  # normalize by bin area
+        # Lazy init for pooling arrays based on target_size
+        if not hasattr(self, '_pool_cache') or self._pool_cache.get('size') != target_size:
+            pr = np.linspace(0, self.BOARD_SIZE, target_size + 1, dtype=int)
+            pc = np.linspace(0, self.BOARD_SIZE, target_size + 1, dtype=int)
+            pa = (np.diff(pr)[:, None] * np.diff(pc)[None, :]).astype(np.float32)
+            self._pool_cache = {'size': target_size, 'rows': pr, 'cols': pc, 'areas': pa}
+            
+        pr = self._pool_cache['rows']
+        pc = self._pool_cache['cols']
+        pa = self._pool_cache['areas']
+
+        row_sums = np.add.reduceat(planes, pr[:-1], axis=1)
+        bin_sums = np.add.reduceat(row_sums, pc[:-1], axis=2)
+        return bin_sums / pa
 
     def get_global_state(self) -> np.ndarray:
         """
@@ -528,10 +528,10 @@ class EightInARowEnv:
             obs_local = np.pad(obs_local, ((0, 0), (0, pad_h), (0, pad_w)), mode='constant', constant_values=0)
 
         # --- Global Thumbnail (pure numpy, no torch) ---
-        obs_global = self._numpy_area_pool(rotated)
+        obs_global = self._numpy_area_pool(rotated, view_size)
 
         # --- Concatenate ---
-        obs = np.concatenate([obs_local, obs_global], axis=0)  # (8, 21, 21)
+        obs = np.concatenate([obs_local, obs_global], axis=0)  # (8, view_size, view_size)
 
         return obs, (cr, cc)
 

@@ -417,11 +417,22 @@
                                 scoreHistory.green[scoreHistory.green.length - 1] = cumulativePoints[2];
                                 scoreHistory.blue[scoreHistory.blue.length - 1] = cumulativePoints[3];
                             } else if (entryRounds > lastLabel) {
+                                // Fill intermediate missing rounds to draw flat horizontal lines instead of point-skip slopes
+                                if (lastLabel !== -1 && entryRounds > lastLabel + 1) {
+                                    for (let r = lastLabel + 1; r < entryRounds; r++) {
+                                        scoreHistory.labels.push(r);
+                                        scoreHistory.red.push(prevCumPoints[1]);
+                                        scoreHistory.green.push(prevCumPoints[2]);
+                                        scoreHistory.blue.push(prevCumPoints[3]);
+                                    }
+                                }
                                 scoreHistory.labels.push(entryRounds);
                                 scoreHistory.red.push(cumulativePoints[1]);
                                 scoreHistory.green.push(cumulativePoints[2]);
                                 scoreHistory.blue.push(cumulativePoints[3]);
-                                if (scoreHistory.labels.length > MAX_SCORE_POINTS) {
+
+                                // Clean up overflow points
+                                while (scoreHistory.labels.length > MAX_SCORE_POINTS) {
                                     scoreHistory.labels.shift();
                                     scoreHistory.red.shift();
                                     scoreHistory.green.shift();

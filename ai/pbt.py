@@ -173,7 +173,7 @@ class Population:
         if not os.path.exists(path):
             return
         try:
-            payload = torch.load(path, map_location='cpu')
+            payload = torch.load(path, map_location='cpu', weights_only=True)
             self.generation = payload.get('generation', 0)
             agent_data = payload.get('agents', [])
             if not isinstance(agent_data, list):

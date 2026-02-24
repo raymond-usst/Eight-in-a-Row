@@ -208,10 +208,7 @@ def reanalyze_worker(rank, config, reanalyze_in_queue, reanalyze_out_queue, stop
                 ctr = game.centers[i]
                 from ai.self_play import _get_observation_and_mask
                 rotated = env._get_rotated_planes_cached()
-                legal = env.legal_moves_local(ctr[0], ctr[1], config.local_view_size)
-                legal_mask = np.zeros(config.policy_size, dtype=np.float32)
-                for lr, lc in legal:
-                    legal_mask[lr * config.local_view_size + lc] = 1.0
+                _, legal_mask = env.get_legal_moves_and_mask(ctr[0], ctr[1], config.local_view_size)
                 obs, _, _ = _get_observation_and_mask(env, config, ctr[0], ctr[1], legal_mask, rotated)
                 
                 ctx = None
@@ -275,8 +272,12 @@ def buffer_loop(config, buffer_queue, batch_queue, cmd_queue, res_queue, stop_ev
                         current_batch_size = int(config.batch_size_start + (config.batch_size_end - config.batch_size_start) * progress)
 
                         batch = buffer.sample_batch(
-                            current_batch_size, config.num_unroll_steps,
-                            config.td_steps, config.discount, config.policy_size
+                            batch_size=current_batch_size,
+                            num_unroll_steps=config.num_unroll_steps,
+                            td_steps=config.td_steps,
+                            discount=config.discount,
+                            action_size=config.policy_size,
+                            view_size=config.local_view_size
                         )
                         if getattr(config, 'augment_board', False):
                             apply_board_augment(batch, numpy_rng, noise_std=getattr(config, 'augment_noise_std', 0.0) or None)
@@ -340,10 +341,13 @@ def buffer_loop(config, buffer_queue, batch_queue, cmd_queue, res_queue, stop_ev
                         res_queue.put({'type': 'save_ok', 'report': buffer.memory_report()})
                     elif cmd_type == 'report':
                         res_queue.put({'type': 'report_ok', 'report': buffer.memory_report()})
+                    elif cmd_type == 'num_games':
+                        res_queue.put({'type': 'num_games_ok', 'num_games': buffer.num_games()})
                 except queue.Empty:
                     break
             
-            if now - last_games_update > 1.0:
+            # Update shared count more frequently (0.2s) so Data Gen progress displays correctly
+            if now - last_games_update > 0.2:
                 shared_buffer_games.value = buffer.num_games()
                 last_games_update = now
 
@@ -774,6 +778,7 @@ def learner_loop(config, args, game_queue, weights_path, memory_path, stop_event
 
         last_curriculum_check_games = 0
         last_curriculum_check_wins = 0
+        board_size_discard_count = 0  # Track games discarded due to curriculum stage mismatch
 
         # ── Resume from checkpoint ──────────────────────────────────
         data = None
@@ -877,7 +882,8 @@ def learner_loop(config, args, game_queue, weights_path, memory_path, stop_event
                 # Checkpoint Curriculum & League restore
                 if curriculum and isinstance(data, dict) and 'curriculum_state' in data:
                     curriculum.load_state_dict(data['curriculum_state'])
-                    print(f"[Learner] Curriculum Restore: Stage {curriculum.current_stage}")
+                    st = curriculum.get_current_stage()
+                    print(f"[Learner] Curriculum Restore: Stage {st.stage_id} ({st.board_size}x{st.board_size})")
                 
                 if league and isinstance(data, dict) and 'league_current_elo' in data:
                     league.current_elo = data['league_current_elo']
@@ -1184,6 +1190,9 @@ def learner_loop(config, args, game_queue, weights_path, memory_path, stop_event
                     
                     # Verify game matches current curriculum stage
                     if game.board_size != expected_size:
+                        board_size_discard_count += 1
+                        if board_size_discard_count <= 5 or board_size_discard_count % 50 == 0:
+                            print(f"[Learner] Discarded game: board_size={game.board_size} != expected {expected_size} (total discarded: {board_size_discard_count})", flush=True)
                         continue
 
                     # Score for curriculum: 1.0 win, 0.5 draw, 0.0 loss (for current/active agent)
@@ -1247,10 +1256,8 @@ def learner_loop(config, args, game_queue, weights_path, memory_path, stop_event
                     start_wait_time = time.time()
                 
                 time.sleep(0.2)
-                current_time = datetime.now().strftime("%H:%M:%S")
-                
-                count = shared_buffer_games.value
                 elapsed = time.time() - start_wait_time
+                count = shared_buffer_games.value
                 if count > 0 and elapsed > 1.0:
                     rate = count / elapsed  # games/sec
                     remaining = config.min_buffer_size - count
@@ -1261,10 +1268,15 @@ def learner_loop(config, args, game_queue, weights_path, memory_path, stop_event
                     eta_str = "Calculating..."
                     speed_str = "..."
 
-                percent = (count / config.min_buffer_size) * 100
-                print(f"[{current_time}] [Data Gen] Progress: {count}/{config.min_buffer_size} ({percent:.1f}%) | Speed: {speed_str} | ETA: {eta_str}", flush=True)
+                # Throttle prints to every 2s; dashboard update every loop for responsiveness
+                if 'last_data_gen_print' not in locals() or (time.time() - last_data_gen_print) >= 2.0:
+                    last_data_gen_print = time.time()
+                    current_time = datetime.now().strftime("%H:%M:%S")
+                    percent = (count / config.min_buffer_size) * 100
+                    recv_hint = f" (received {game_receive_count})" if game_receive_count > 0 and count == 0 else ""
+                    wait_hint = " (30x30 games ~1-2 min each; actors in progress)" if count == 0 and elapsed > 30 else ""
+                    print(f"[{current_time}] [Data Gen] Progress: {count}/{config.min_buffer_size} ({percent:.1f}%) | Speed: {speed_str} | ETA: {eta_str}{recv_hint}{wait_hint}", flush=True)
                 
-                # Update Dashboard Status (Waiting Phase)
                 stats = shared_stats.get_info()
                 broadcast('status', {
                     'total_games': stats['games'],
@@ -1278,6 +1290,7 @@ def learner_loop(config, args, game_queue, weights_path, memory_path, stop_event
                     'step': f"Gen {count}/{config.min_buffer_size}",
                     'lr': 0.0
                 })
+                
                 
                 # Forward Live Events (while waiting)
                 if live_queue:
@@ -1507,10 +1520,11 @@ def learner_loop(config, args, game_queue, weights_path, memory_path, stop_event
                             fetched_evts += 1
                         except Exception: break
                 
-                # Broadcast Metrics
+                # Broadcast Metrics (include buffer_games so dashboard shows current buffer)
                 stats_snapshot = shared_stats.get_info()
                 m = {
                     'step': step,
+                    'buffer_games': shared_buffer_games.value,
                     'loss': float(loss_dict['total']),
                     'loss_value': float(loss_dict.get('value', 0.0)),
                     'loss_reward': float(loss_dict.get('reward', 0.0)),
@@ -1569,7 +1583,7 @@ def learner_loop(config, args, game_queue, weights_path, memory_path, stop_event
                 curriculum.record_loss(loss_dict['total'])
 
             if step % 100 == 0:
-                if curriculum.check_graduation(league=league):
+                if curriculum.check_graduation(step=step, league=league):
                     new_stage = curriculum.advance(league=league)
                     if new_stage:
                         if shared_curriculum_stage is not None:
@@ -1849,6 +1863,23 @@ def main():
     stop_event = mp.Event()
     shared_stats = SharedStats()
     shared_curriculum_stage = mp.Value('i', 0)
+
+    # Pre-load curriculum stage before spawning actors (so actors use correct board size from first game)
+    if args.resume and getattr(config, 'auto_curriculum', False):
+        latest_ckpt = os.path.join(config.checkpoint_dir, 'latest.pt')
+        if os.path.exists(latest_ckpt):
+            try:
+                data = torch.load(latest_ckpt, map_location='cpu', weights_only=False)
+                if isinstance(data, dict) and 'curriculum_state' in data:
+                    cs = data['curriculum_state']
+                    stage_idx = int(cs.get('current_stage_idx', 0))
+                    shared_curriculum_stage.value = stage_idx
+                    print(f"[Main] Pre-loaded curriculum stage {stage_idx + 1} for actors (before spawn).")
+                elif isinstance(data, dict) and 'curriculum_stage' in data:
+                    shared_curriculum_stage.value = int(data['curriculum_stage'])
+                    print(f"[Main] Pre-loaded curriculum_stage={data['curriculum_stage']} for actors.")
+            except Exception as e:
+                print(f"[Main] Could not pre-load curriculum (actors may produce wrong-sized games briefly): {e}")
 
     live_queue = mp.Queue(maxsize=config.live_queue_maxsize)
 
