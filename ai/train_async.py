@@ -1,6 +1,7 @@
 """Async MuZero training: CPU Self-Play + GPU Training."""
 
 import os
+import re
 import sys
 import time
 import json
@@ -630,6 +631,7 @@ def actor_loop(rank, config, game_queue, weights_path, memory_path, stop_event, 
                         shared_stats.update_round(rw, rr)
 
                 # Every 100 total games: save last game board image (Actor 0 only)
+                # Use next available number from existing img/game_*.png so breakpoint resume never overwrites.
                 if rank == 0 and session_games:
                     new_total = shared_stats.total_games.value
                     if new_total >= 100 and new_total // 100 > prev_total_games // 100:
@@ -637,8 +639,17 @@ def actor_loop(rank, config, game_queue, weights_path, memory_path, stop_event, 
                         board = getattr(last_game, 'final_board', None)
                         if board is not None:
                             img_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'img')
-                            milestone = (new_total // 100) * 100
-                            path = os.path.join(img_dir, f'game_{milestone}.png')
+                            os.makedirs(img_dir, exist_ok=True)
+                            existing = []
+                            try:
+                                for f in os.listdir(img_dir):
+                                    m = re.match(r'game_(\d+)\.png', f)
+                                    if m:
+                                        existing.append(int(m.group(1)))
+                            except OSError:
+                                pass
+                            next_milestone = (max(existing) + 100) if existing else 100
+                            path = os.path.join(img_dir, f'game_{next_milestone}.png')
                             if board_to_image_path(board, path):
                                 print(f"[Actor 0] Saved board image: {path}", flush=True)
 
@@ -828,22 +839,39 @@ def learner_loop(config, args, game_queue, weights_path, memory_path, stop_event
                 
                 shared_stats.total_steps.value = step
 
-                # Restore stats
+                # Restore stats (strict: always prefer checkpoint; fallback for old/weights-only format)
                 stats = data.get('stats', {}) if isinstance(data, dict) else {}
+                # Cross-compat: train.py uses top-level 'total_games'; ensure we never reset to 0 when ckpt has it
+                ckpt_games = stats.get('games') if isinstance(stats, dict) else None
+                if ckpt_games is None and isinstance(data, dict):
+                    ckpt_games = data.get('total_games', 0)
+                ckpt_games = ckpt_games if ckpt_games is not None else 0
                 with shared_stats.lock:
-                    shared_stats.total_games.value = stats.get('games', 0)
-                    shared_stats.total_game_len.value = stats.get('total_len', 0)
-                    wc = stats.get('wins', {})
+                    shared_stats.total_games.value = int(ckpt_games)
+                    shared_stats.total_game_len.value = int(stats.get('total_len', 0)) if isinstance(stats, dict) else 0
+                    wc = stats.get('wins', {}) if isinstance(stats, dict) else {}
                     shared_stats.win_counts[0] = wc.get('1', 0)
                     shared_stats.win_counts[1] = wc.get('2', 0)
                     shared_stats.win_counts[2] = wc.get('3', 0)
                     shared_stats.win_counts[3] = wc.get('draw', 0)
-                    shared_stats.ranked_games.value = stats.get('ranked_games', 0)
-                    plc = stats.get('placements', {})
+                    shared_stats.ranked_games.value = int(stats.get('ranked_games', 0)) if isinstance(stats, dict) else 0
+                    plc = stats.get('placements', {}) if isinstance(stats, dict) else {}
                     for pid in (1, 2, 3):
                         arr = plc.get(str(pid), [0, 0, 0])
                         for pl in range(3):
                             shared_stats.placement_counts[(pid - 1) * 3 + pl] = arr[pl] if pl < len(arr) else 0
+                    # Round-level stats (Best-of-5)
+                    if isinstance(stats, dict):
+                        shared_stats.total_rounds.value = int(stats.get('total_rounds', 0))
+                        rw = stats.get('round_wins', {})
+                        for i in range(4):
+                            key = 'draw' if i == 3 else str(i + 1)
+                            shared_stats.round_win_counts[i] = int(rw.get(key, 0))
+                        rpc = stats.get('round_placements', {})
+                        for pid in (1, 2, 3):
+                            arr = rpc.get(str(pid), [0, 0, 0])
+                            for pl in range(3):
+                                shared_stats.round_placement_counts[(pid - 1) * 3 + pl] = arr[pl] if pl < len(arr) else 0
                 
                 # Checkpoint KOTH restore
                 koth_active_pid = data.get('koth_active_pid', 1) if isinstance(data, dict) else 1
@@ -924,12 +952,13 @@ def learner_loop(config, args, game_queue, weights_path, memory_path, stop_event
                             param_group.setdefault('initial_lr', config.learning_rate)
                         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda, last_epoch=step - 1)
                         # Save the fixed FULL checkpoint (not just state_dict!) so resume still works
+                        # Use current shared_stats so we never persist empty stats (e.g. after old-format load)
                         fixed_data = {
                             'step': step,
                             'model': _strip_compiled_prefix(model.state_dict()),
                             'optimizer': optimizer.state_dict(),
                             'scaler': scaler.state_dict(),
-                            'stats': stats,
+                            'stats': shared_stats.get_info(),
                             'curriculum_state': curriculum.state_dict(),
                             'league_current_elo': league.current_elo
                         }
@@ -1145,7 +1174,9 @@ def learner_loop(config, args, game_queue, weights_path, memory_path, stop_event
                 curriculum.load_state_dict(data['curriculum_state'])
                 last_stage = curriculum.current_stage_idx
             elif 'curriculum_stage' in data:
-                last_stage = data['curriculum_stage']
+                raw = int(data['curriculum_stage'])
+                last_stage = (raw - 1) if 1 <= raw <= 4 else raw
+                last_stage = min(len(curriculum.stages) - 1, max(0, last_stage))
                 curriculum.set_stage(last_stage)
             else:
                 _log_learner.warning("Resume: no curriculum_state or curriculum_stage in checkpoint; using default stage.")
@@ -1274,6 +1305,8 @@ def learner_loop(config, args, game_queue, weights_path, memory_path, stop_event
                     current_time = datetime.now().strftime("%H:%M:%S")
                     percent = (count / config.min_buffer_size) * 100
                     recv_hint = f" (received {game_receive_count})" if game_receive_count > 0 and count == 0 else ""
+                    if count == 0 and board_size_discard_count > 0:
+                        recv_hint += f" (discarded {board_size_discard_count} games: board_size mismatch, expect {expected_size}x{expected_size})"
                     wait_hint = " (30x30 games ~1-2 min each; actors in progress)" if count == 0 and elapsed > 30 else ""
                     print(f"[{current_time}] [Data Gen] Progress: {count}/{config.min_buffer_size} ({percent:.1f}%) | Speed: {speed_str} | ETA: {eta_str}{recv_hint}{wait_hint}", flush=True)
                 
@@ -1587,7 +1620,8 @@ def learner_loop(config, args, game_queue, weights_path, memory_path, stop_event
                     new_stage = curriculum.advance(league=league)
                     if new_stage:
                         if shared_curriculum_stage is not None:
-                            shared_curriculum_stage.value = new_stage.stage_id
+                            # Actors index stages by 0-based index; store current_stage_idx not stage_id (1-4)
+                            shared_curriculum_stage.value = curriculum.current_stage_idx
                         broadcast('curriculum_graduation', {
                             'stage_id': new_stage.stage_id,
                             'stage': str(new_stage),
@@ -1610,8 +1644,8 @@ def learner_loop(config, args, game_queue, weights_path, memory_path, stop_event
                         
                         _log_learner.info("Saved graduation snapshot: %s", grad_path)
                         
-                        # Update last_stage for loop check
-                        last_stage = new_stage.stage_id
+                        # Update last_stage for loop check (use 0-based index)
+                        last_stage = curriculum.current_stage_idx
 
 
             # 3. Sync Weights (shared memory + file backup)
@@ -1876,8 +1910,11 @@ def main():
                     shared_curriculum_stage.value = stage_idx
                     print(f"[Main] Pre-loaded curriculum stage {stage_idx + 1} for actors (before spawn).")
                 elif isinstance(data, dict) and 'curriculum_stage' in data:
-                    shared_curriculum_stage.value = int(data['curriculum_stage'])
-                    print(f"[Main] Pre-loaded curriculum_stage={data['curriculum_stage']} for actors.")
+                    raw = int(data['curriculum_stage'])
+                    # Support both 0-based index (0-3) and legacy stage_id (1-4)
+                    stage_idx = (raw - 1) if 1 <= raw <= 4 else raw
+                    shared_curriculum_stage.value = min(3, max(0, stage_idx))
+                    print(f"[Main] Pre-loaded curriculum_stage (index {shared_curriculum_stage.value}) for actors.")
             except Exception as e:
                 print(f"[Main] Could not pre-load curriculum (actors may produce wrong-sized games briefly): {e}")
 

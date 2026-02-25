@@ -458,23 +458,20 @@ class EightInARowEnv:
         return self._cached_rotated
 
     def _numpy_area_pool(self, planes: np.ndarray, target_size: int) -> np.ndarray:
-        """Pure-numpy area interpolation."""
-        if self.BOARD_SIZE < target_size:
-            _, h, w = planes.shape
+        """Pure-numpy area interpolation. Uses planes shape so it works for any board size (e.g. curriculum)."""
+        _, h, w = planes.shape
+        if h < target_size or w < target_size:
             pad_h = target_size - h
             pad_w = target_size - w
             return np.pad(planes, ((0, 0), (0, pad_h), (0, pad_w)), mode='constant', constant_values=0)
 
-        # Lazy init for pooling arrays based on target_size
-        if not hasattr(self, '_pool_cache') or self._pool_cache.get('size') != target_size:
-            pr = np.linspace(0, self.BOARD_SIZE, target_size + 1, dtype=int)
-            pc = np.linspace(0, self.BOARD_SIZE, target_size + 1, dtype=int)
-            pa = (np.diff(pr)[:, None] * np.diff(pc)[None, :]).astype(np.float32)
-            self._pool_cache = {'size': target_size, 'rows': pr, 'cols': pc, 'areas': pa}
-            
-        pr = self._pool_cache['rows']
-        pc = self._pool_cache['cols']
-        pa = self._pool_cache['areas']
+        # Build indices from actual planes shape (not self.BOARD_SIZE) to avoid wrong/negative indices when env and game sizes differ
+        pr = np.linspace(0, h, target_size + 1, dtype=np.intp)
+        pc = np.linspace(0, w, target_size + 1, dtype=np.intp)
+        pr = np.clip(pr, 0, h)
+        pc = np.clip(pc, 0, w)
+        pa = (np.diff(pr)[:, None] * np.diff(pc)[None, :]).astype(np.float32)
+        pa = np.maximum(pa, 1e-8)
 
         row_sums = np.add.reduceat(planes, pr[:-1], axis=1)
         bin_sums = np.add.reduceat(row_sums, pc[:-1], axis=2)

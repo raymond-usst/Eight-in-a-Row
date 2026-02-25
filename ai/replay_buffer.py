@@ -676,7 +676,7 @@ class ReplayBuffer:
             }
             
             from ai.game_env import EightInARowEnv
-            if not hasattr(self, '_obs_env'):
+            if not hasattr(self, '_obs_env') or self._obs_env.BOARD_SIZE != BOARD_SIZE:
                 self._obs_env = EightInARowEnv(board_size=BOARD_SIZE)
             
             # Since get_observation expects `env.board`, we recreate the view dynamically
@@ -818,9 +818,11 @@ class ReplayBuffer:
                 rel_r = abs_r - (ctr[0] - h_half)
                 rel_c = abs_c - (ctr[1] - h_half)
 
-                # Mask: keep only coordinates within [0, VIEW_SIZE)
+                # Mask: keep only coordinates within [0, VIEW_SIZE); clip to avoid negative indices (numpy forbids them in fancy indexing)
                 valid = (rel_r >= 0) & (rel_r < VIEW_SIZE) & (rel_c >= 0) & (rel_c < VIEW_SIZE)
-                heatmap[rel_r[valid], rel_c[valid]] = 1.0
+                rel_r_safe = np.clip(rel_r, 0, VIEW_SIZE - 1).astype(np.intp)
+                rel_c_safe = np.clip(rel_c, 0, VIEW_SIZE - 1).astype(np.intp)
+                heatmap[rel_r_safe[valid], rel_c_safe[valid]] = 1.0
             
             batch_heatmaps.append(heatmap)
             

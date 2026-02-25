@@ -204,7 +204,18 @@ class InferenceServer:
             if not pending:
                 continue
                 
-            # Process batches by OP type
+            # Process batches by OP type. Group by tensor shape so curriculum (different board sizes) never concatenate.
+            def group_by_shape(addrs, payloads, key_idx=0):
+                """Group (addrs, payloads) by shape of payload[key_idx]. Returns list of (addrs_sub, payloads_sub)."""
+                groups = {}
+                for addr, p in zip(addrs, payloads):
+                    sh = p[key_idx].shape
+                    if sh not in groups:
+                        groups[sh] = ([], [])
+                    groups[sh][0].append(addr)
+                    groups[sh][1].append(p)
+                return list(groups.values())
+            
             with torch.no_grad():
                 for op, reqs in pending.items():
                     addrs = [req[0] for req in reqs]
@@ -221,64 +232,54 @@ class InferenceServer:
                         last_log_time = time.time()
                     
                     if op == OP_INITIAL:
-                        # payloads are [[obs, ctx], [obs, ctx], ...]
-                        obs_list = [p[0] for p in payloads]
-                        ctx_list = [p[1] for p in payloads]
-                        
-                        # Stack manually
-                        obs_tensor = torch.from_numpy(np.concatenate(obs_list, axis=0)).to(self.device)
-                        if ctx_list[0] is not None:
-                            ctx_tensor = torch.from_numpy(np.concatenate(ctx_list, axis=0)).to(self.device)
-                        else:
-                            ctx_tensor = None
-                            
-                        # Batch Inference
-                        hidden_states, policy_logits, values = self.model.initial_inference(obs_tensor, session_context=ctx_tensor)
-                        
-                        # Disperse back to clients
-                        # Each client sent its own batch; results are concatenated in order.
-                        # Track cumulative batch offset per client.
-                        offset = 0
-                        for i, addr in enumerate(addrs):
-                            bs = payloads[i][0].shape[0]  # batch size from this client
-                            res = [hidden_states[offset:offset+bs], policy_logits[offset:offset+bs], values[offset:offset+bs]]
-                            self.socket.send_multipart([addr, b""] + self._serialize_tensors(res))
-                            offset += bs
+                        # payloads are [[obs, ctx], ...]; group by obs shape (board size)
+                        for addrs_g, payloads_g in group_by_shape(addrs, payloads, 0):
+                            obs_list = [p[0] for p in payloads_g]
+                            ctx_list = [p[1] for p in payloads_g]
+                            obs_tensor = torch.from_numpy(np.concatenate(obs_list, axis=0)).to(self.device)
+                            if ctx_list[0] is not None:
+                                ctx_tensor = torch.from_numpy(np.concatenate(ctx_list, axis=0)).to(self.device)
+                            else:
+                                ctx_tensor = None
+                            hidden_states, policy_logits, values = self.model.initial_inference(obs_tensor, session_context=ctx_tensor)
+                            offset = 0
+                            for i, addr in enumerate(addrs_g):
+                                bs = payloads_g[i][0].shape[0]
+                                res = [hidden_states[offset:offset+bs], policy_logits[offset:offset+bs], values[offset:offset+bs]]
+                                self.socket.send_multipart([addr, b""] + self._serialize_tensors(res))
+                                offset += bs
                             
                     elif op == OP_RECURRENT:
-                        # payloads are [[hidden, action], ...]
-                        h_list = [p[0] for p in payloads]
-                        a_list = [p[1] for p in payloads]
-                        
-                        h_tensor = torch.from_numpy(np.concatenate(h_list, axis=0)).to(self.device)
-                        a_tensor = torch.from_numpy(np.concatenate(a_list, axis=0)).to(self.device)
-                        
-                        next_hiddens, rewards, policy_logits, values = self.model.recurrent_inference(h_tensor, a_tensor)
-                        
-                        offset = 0
-                        for i, addr in enumerate(addrs):
-                            bs = payloads[i][0].shape[0]  # batch size from this client
-                            res = [next_hiddens[offset:offset+bs], rewards[offset:offset+bs], policy_logits[offset:offset+bs], values[offset:offset+bs]]
-                            self.socket.send_multipart([addr, b""] + self._serialize_tensors(res))
-                            offset += bs
+                        # hidden/action shapes are typically uniform; group by hidden shape for safety
+                        for addrs_g, payloads_g in group_by_shape(addrs, payloads, 0):
+                            h_list = [p[0] for p in payloads_g]
+                            a_list = [p[1] for p in payloads_g]
+                            h_tensor = torch.from_numpy(np.concatenate(h_list, axis=0)).to(self.device)
+                            a_tensor = torch.from_numpy(np.concatenate(a_list, axis=0)).to(self.device)
+                            next_hiddens, rewards, policy_logits, values = self.model.recurrent_inference(h_tensor, a_tensor)
+                            offset = 0
+                            for i, addr in enumerate(addrs_g):
+                                bs = payloads_g[i][0].shape[0]
+                                res = [next_hiddens[offset:offset+bs], rewards[offset:offset+bs], policy_logits[offset:offset+bs], values[offset:offset+bs]]
+                                self.socket.send_multipart([addr, b""] + self._serialize_tensors(res))
+                                offset += bs
                             
                     elif op == OP_CENTER:
-                        # Focus network forward
-                        gs_list = [p[0] for p in payloads]
-                        gs_tensor = torch.from_numpy(np.concatenate(gs_list, axis=0)).to(self.device)
-                        
-                        if hasattr(self.model, 'focus_net'):
-                            coords = self.model.focus_net(gs_tensor)
-                            w = gs_tensor.shape[-1]
-                            for i, addr in enumerate(addrs):
-                                r = int(coords[i, 0].item() * w)
-                                c = int(coords[i, 1].item() * w)
-                                r = max(0, min(w-1, r))
-                                c = max(0, min(w-1, c))
-                                res = [torch.tensor([r], dtype=torch.int32), torch.tensor([c], dtype=torch.int32)]
-                                self.socket.send_multipart([addr, b""] + self._serialize_tensors(res))
-                        else:
-                            # Fallback if network doesn't support center
-                            for i, addr in enumerate(addrs):
-                                res = [torch.tensor([0], dtype=torch.int32), torch.tensor([0], dtype=torch.int32)]
-                                self.socket.send_multipart([addr, b""] + self._serialize_tensors(res))
+                        # Focus network: group by global_state shape (board size)
+                        for addrs_g, payloads_g in group_by_shape(addrs, payloads, 0):
+                            gs_list = [p[0] for p in payloads_g]
+                            gs_tensor = torch.from_numpy(np.concatenate(gs_list, axis=0)).to(self.device)
+                            if hasattr(self.model, 'focus_net'):
+                                coords = self.model.focus_net(gs_tensor)
+                                w = gs_tensor.shape[-1]
+                                for i, addr in enumerate(addrs_g):
+                                    r = int(coords[i, 0].item() * w)
+                                    c = int(coords[i, 1].item() * w)
+                                    r = max(0, min(w-1, r))
+                                    c = max(0, min(w-1, c))
+                                    res = [torch.tensor([r], dtype=torch.int32), torch.tensor([c], dtype=torch.int32)]
+                                    self.socket.send_multipart([addr, b""] + self._serialize_tensors(res))
+                            else:
+                                for addr in addrs_g:
+                                    res = [torch.tensor([0], dtype=torch.int32), torch.tensor([0], dtype=torch.int32)]
+                                    self.socket.send_multipart([addr, b""] + self._serialize_tensors(res))
