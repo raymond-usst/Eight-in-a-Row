@@ -22,8 +22,8 @@
             <span id="ws-label">未连接</span>
             <input id="ws-url" type="text" value="ws://localhost:5001" placeholder="ws://localhost:5001" />
             <button id="btn-connect" class="btn">连接</button>
-            <span id="connection-hint" class="connection-hint">先启动训练 (python -m ai.train_async ...)，默认端口 5001；远程请填
-                ws://主机IP:5001</span>
+            <span id="connection-hint" class="connection-hint">先启动训练 (python -m ai.train_async)，控制台出现「WebSocket
+                已就绪」后再连接；默认 ws://localhost:5001，端口占用可加 --ws-port 5002</span>
         </div>
     </header>
 
@@ -194,6 +194,7 @@
         <span id="sum-buf">Buffer: 0</span>
         <span id="sum-session">会话: -</span>
         <span id="sum-elo">ELO: -</span>
+        <span id="sum-arena-elo">Arena Elo: -</span>
         <span id="sum-time">运行时间: 0min</span>
     </footer>
 

@@ -355,17 +355,28 @@
         // Trigger AI turn if in AI mode. Also protect against infinite loop
         // by only automatically triggering AI turns if a human initiated it, or
         // if the recursive call detects it is an AI turn.
-        if (gameMode === 'ai' && !gameOver) {
+        if (isHuman && gameMode === 'ai' && !gameOver) {
             processAITurns();
         }
     }
 
     function undoMove() {
         if (moveHistory.length === 0 || gameOver || aiThinking) return;
-        const last = moveHistory.pop();
-        board[last.row][last.col] = null;
-        moveCount--;
-        currentPlayerIdx = PLAYERS.indexOf(last.player);
+
+        if (gameMode === 'ai') {
+            do {
+                const last = moveHistory.pop();
+                board[last.row][last.col] = null;
+                moveCount--;
+                currentPlayerIdx = PLAYERS.indexOf(last.player);
+            } while (moveHistory.length > 0 && PLAYERS[currentPlayerIdx] !== humanColor);
+        } else {
+            const last = moveHistory.pop();
+            board[last.row][last.col] = null;
+            moveCount--;
+            currentPlayerIdx = PLAYERS.indexOf(last.player);
+        }
+
         recalcStats();
         updateUI();
         render();
@@ -843,9 +854,17 @@
     }
 
     async function processAITurns() {
-        // Process consecutive AI turns (since there are 2 AI players)
-        while (!gameOver && gameMode === 'ai' && PLAYERS[currentPlayerIdx] !== humanColor) {
-            await requestAIMove();
+        // Prevent multiple simultaneous processAITurns loops
+        if (window._aiProcessing) return;
+        window._aiProcessing = true;
+
+        try {
+            // Process consecutive AI turns (since there are 2 AI players)
+            while (!gameOver && gameMode === 'ai' && PLAYERS[currentPlayerIdx] !== humanColor) {
+                await requestAIMove();
+            }
+        } finally {
+            window._aiProcessing = false;
         }
     }
 
@@ -854,27 +873,41 @@
 
         aiThinking = true;
         showThinking(true);
+
+        // Detach old WebSocket handlers before closing to prevent stale
+        // onclose from firing and placing phantom moves.
         if (aiWebSocket) {
+            aiWebSocket.onopen = null;
+            aiWebSocket.onmessage = null;
+            aiWebSocket.onerror = null;
+            aiWebSocket.onclose = null;
             aiWebSocket.close();
+            aiWebSocket = null;
         }
 
         return new Promise((resolve) => {
-            aiWebSocket = new WebSocket(AI_SERVER_WS);
-            
-            aiWebSocket.onopen = () => {
+            let resolved = false;
+            const safeResolve = () => { if (!resolved) { resolved = true; resolve(); } };
+
+            const ws = new WebSocket(AI_SERVER_WS);
+            aiWebSocket = ws;
+
+            ws.onopen = () => {
+                // Guard: only act if this is still the active WebSocket
+                if (ws !== aiWebSocket) return;
                 const boardData = getBoardForAPI();
                 const currentPid = PLAYER_TO_ID[PLAYERS[currentPlayerIdx]];
-                aiWebSocket.send(JSON.stringify({
+                ws.send(JSON.stringify({
                     board: boardData,
                     current_player: currentPid,
                     move_history: moveHistory.map(m => [m.row, m.col, PLAYER_TO_ID[m.player]]),
                 }));
             };
 
-            aiWebSocket.onmessage = (event) => {
+            ws.onmessage = (event) => {
+                if (ws !== aiWebSocket) return;
                 const data = JSON.parse(event.data);
                 if (data.type === 'progress') {
-                    // Update thinking indicator text
                     const el = document.getElementById('ai-thinking');
                     el.textContent = '🧠 ' + data.message;
                 } else if (data.type === 'result') {
@@ -888,30 +921,32 @@
                         console.warn('AI returned invalid move, picking random');
                         placeRandomMove();
                     }
-                    resolve();
+                    safeResolve();
                 } else if (data.error) {
                     console.error('AI error:', data.error);
                     aiThinking = false;
                     showThinking(false);
                     placeRandomMove();
-                    resolve();
+                    safeResolve();
                 }
             };
 
-            aiWebSocket.onerror = (error) => {
+            ws.onerror = (error) => {
+                if (ws !== aiWebSocket) return;
                 console.error('WebSocket Error:', error);
                 aiThinking = false;
                 showThinking(false);
                 placeRandomMove();
-                resolve();
+                safeResolve();
             };
 
-            aiWebSocket.onclose = () => {
+            ws.onclose = () => {
+                if (ws !== aiWebSocket) return;
                 if (aiThinking) {
                     aiThinking = false;
                     showThinking(false);
                     placeRandomMove();
-                    resolve();
+                    safeResolve();
                 }
             };
         });

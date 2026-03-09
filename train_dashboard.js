@@ -21,6 +21,7 @@
 
     // ---- State ----
     let ws = null;
+    let reconnectTimer = null;
     let board = [];          // 100x100
     let boardCanvas, boardCtx;
     let gameStep = 0;
@@ -55,10 +56,25 @@
     let winrateViewMode = 'game';
     let placementViewMode = 'game';
 
+    /**
+     * Normalize win_counts from server (string keys '1','2','3','draw')
+     * into JS integer keys (1,2,3) + 'draw'.
+     */
+    function normalizeWinCounts(serverCounts) {
+        if (!serverCounts) return winCounts;
+        return {
+            1: serverCounts[1] ?? serverCounts['1'] ?? 0,
+            2: serverCounts[2] ?? serverCounts['2'] ?? 0,
+            3: serverCounts[3] ?? serverCounts['3'] ?? 0,
+            draw: serverCounts['draw'] ?? serverCounts.draw ?? 0,
+        };
+    }
+
     // ELO tracking
     let eloRatings = { 1: ELO_INITIAL, 2: ELO_INITIAL, 3: ELO_INITIAL };
+    let currentArenaElo = 1200; // Track latest arena elo from server
     let lastEloRankedGames = 0; // prevent re-computation with same data
-    const eloHistory = { labels: [], red: [], green: [], blue: [] };
+    const eloHistory = { labels: [], red: [], green: [], blue: [], arena: [] };
     const MAX_ELO_POINTS = 500;
 
     // Rolling score history for chart (game-by-game)
@@ -110,6 +126,10 @@
     }
 
     function connect() {
+        if (reconnectTimer) {
+            clearTimeout(reconnectTimer);
+            reconnectTimer = null;
+        }
         const url = document.getElementById('ws-url').value;
         if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
             ws.close();
@@ -120,16 +140,14 @@
             ws = new WebSocket(url);
         } catch (e) {
             setStatus('disconnected');
+            scheduleReconnect();
             return;
         }
 
         ws.onopen = () => setStatus('connected');
         ws.onclose = () => {
             setStatus('disconnected');
-            // Auto-reconnect after 3s
-            setTimeout(() => {
-                if (!ws || ws.readyState === WebSocket.CLOSED) connect();
-            }, 3000);
+            scheduleReconnect();
         };
         ws.onerror = () => setStatus('disconnected');
         ws.onmessage = (evt) => {
@@ -142,12 +160,24 @@
         };
     }
 
+    function scheduleReconnect() {
+        if (reconnectTimer) return;
+        reconnectTimer = setTimeout(() => {
+            reconnectTimer = null;
+            if (!ws || ws.readyState === WebSocket.CLOSED) connect();
+        }, 3000);
+    }
+
     function setStatus(status) {
         const dot = document.getElementById('ws-status');
         const label = document.getElementById('ws-label');
         const hint = document.getElementById('connection-hint');
         dot.className = 'status-dot ' + status;
-        const labels = { connected: '已连接', disconnected: '未连接', connecting: '连接中...' };
+        const labels = {
+            connected: '已连接',
+            disconnected: '未连接（将自动重试）',
+            connecting: '连接中...'
+        };
         label.textContent = labels[status] || status;
         if (hint) hint.classList.toggle('hidden', status === 'connected');
     }
@@ -243,7 +273,7 @@
                 updateSummaryBar(msg);
                 // Sync games/win counts from server so 累计胜率 matches 名次分布 (same source)
                 if (msg.total_games !== undefined) totalGames = msg.total_games;
-                if (msg.win_counts) winCounts = { ...winCounts, ...msg.win_counts };
+                if (msg.win_counts) winCounts = normalizeWinCounts(msg.win_counts);
                 updateWinRates();
                 // Sync authoritative round data from all actors
                 if (msg.total_rounds !== undefined) {
@@ -280,12 +310,17 @@
                     const sumEl = document.getElementById('sum-elo');
                     if (sumEl) sumEl.textContent = `ELO: ${Math.round(msg.league_elo)}`;
                 }
+                if (msg.arena_elo !== undefined) {
+                    currentArenaElo = msg.arena_elo;
+                    const sumArena = document.getElementById('sum-arena-elo');
+                    if (sumArena) sumArena.textContent = `Arena Elo: ${Math.round(msg.arena_elo)}`;
+                }
                 break;
 
             case 'batch_stats':
                 // Async mode: stats from all actors
                 if (msg.total_games) totalGames = msg.total_games;
-                if (msg.win_counts) winCounts = { ...winCounts, ...msg.win_counts };
+                if (msg.win_counts) winCounts = normalizeWinCounts(msg.win_counts);
                 updateWinRates();
                 // Sync placement/ELO from all actors
                 if (msg.placements && msg.ranked_games) {
@@ -295,7 +330,7 @@
 
             case 'status':
                 if (msg.total_games !== undefined) totalGames = msg.total_games;
-                if (msg.win_counts) winCounts = { ...winCounts, ...msg.win_counts };
+                if (msg.win_counts) winCounts = normalizeWinCounts(msg.win_counts);
                 updateSummaryBar(msg);
                 // Sync authoritative round data
                 if (msg.total_rounds !== undefined) totalRounds = msg.total_rounds;
@@ -357,7 +392,7 @@
                     // 2. Restore win/round stats from last entry
                     const last = msg.data[msg.data.length - 1];
                     if (last.total_games !== undefined) totalGames = last.total_games;
-                    if (last.win_counts) winCounts = { ...winCounts, ...last.win_counts };
+                    if (last.win_counts) winCounts = normalizeWinCounts(last.win_counts);
                     if (last.total_rounds !== undefined) {
                         totalRounds = last.total_rounds;
                         lastSeenTotalRounds = last.total_rounds; // prevent fake trigger
@@ -385,6 +420,7 @@
                     eloHistory.red.length = 0;
                     eloHistory.green.length = 0;
                     eloHistory.blue.length = 0;
+                    eloHistory.arena.length = 0;
                     scoreHistory.labels.length = 0;
                     scoreHistory.red.length = 0;
                     scoreHistory.green.length = 0;
@@ -454,6 +490,13 @@
                         if (entry.total_rounds && entry.league_elo !== undefined && entry.total_rounds > (eloHistory.labels.length > 0 ? eloHistory.labels[eloHistory.labels.length - 1] : -1)) {
                             eloHistory.labels.push(entry.total_rounds);
                             eloHistory.red.push(entry.league_elo);
+                            if (entry.arena_elo !== undefined) {
+                                currentArenaElo = entry.arena_elo;
+                                eloHistory.arena.push(Math.round(currentArenaElo));
+                            } else {
+                                eloHistory.arena.push(Math.round(currentArenaElo));
+                            }
+
                             // Approximate other players from round placements
                             const rp = entry.round_placements;
                             if (rp) {
@@ -471,6 +514,7 @@
                                 eloHistory.red.shift();
                                 eloHistory.green.shift();
                                 eloHistory.blue.shift();
+                                eloHistory.arena.shift();
                             }
                         }
                     }
@@ -607,12 +651,15 @@
         eloHistory.red.push(Math.round(eloRatings[1]));
         eloHistory.green.push(Math.round(eloRatings[2]));
         eloHistory.blue.push(Math.round(eloRatings[3]));
+        // Just maintain parity with existing array length
+        eloHistory.arena.push(Math.round(currentArenaElo));
 
         if (eloHistory.labels.length > MAX_ELO_POINTS) {
             eloHistory.labels.shift();
             eloHistory.red.shift();
             eloHistory.green.shift();
             eloHistory.blue.shift();
+            eloHistory.arena.shift();
         }
 
         updateEloChart();
@@ -673,16 +720,20 @@
             eloHistory.red[eloHistory.red.length - 1] = Math.round(eloRatings[1]);
             eloHistory.green[eloHistory.green.length - 1] = Math.round(eloRatings[2]);
             eloHistory.blue[eloHistory.blue.length - 1] = Math.round(eloRatings[3]);
+            eloHistory.arena[eloHistory.arena.length - 1] = Math.round(currentArenaElo);
         } else {
             eloHistory.labels.push(roundX);
             eloHistory.red.push(Math.round(eloRatings[1]));
             eloHistory.green.push(Math.round(eloRatings[2]));
             eloHistory.blue.push(Math.round(eloRatings[3]));
+            eloHistory.arena.push(Math.round(currentArenaElo));
+
             if (eloHistory.labels.length > MAX_ELO_POINTS) {
                 eloHistory.labels.shift();
                 eloHistory.red.shift();
                 eloHistory.green.shift();
                 eloHistory.blue.shift();
+                eloHistory.arena.shift();
             }
         }
         updateEloChart();
@@ -707,6 +758,7 @@
         eloChart.data.datasets[0].data = [...eloHistory.red];
         eloChart.data.datasets[1].data = [...eloHistory.green];
         eloChart.data.datasets[2].data = [...eloHistory.blue];
+        eloChart.data.datasets[3].data = [...eloHistory.arena];
         eloChart.update('none');
     }
 
@@ -1071,6 +1123,11 @@
                         borderColor: '#2980b9', backgroundColor: 'rgba(41,128,185,0.06)',
                         borderWidth: 2, pointRadius: 0, tension: 0.4, fill: false,
                     },
+                    {
+                        label: 'Arena ELO', data: [],
+                        borderColor: '#f1c40f', backgroundColor: 'rgba(241,196,15,0.06)',
+                        borderWidth: 2, pointRadius: 0, tension: 0.4, fill: false,
+                    },
                 ],
             },
             options: {
@@ -1133,6 +1190,7 @@
             eloHistory.red.push(ELO_INITIAL);
             eloHistory.green.push(ELO_INITIAL);
             eloHistory.blue.push(ELO_INITIAL);
+            eloHistory.arena.push(1200);
             updateEloChart();
         }
     }
@@ -1196,6 +1254,10 @@
             document.getElementById('sum-lr').textContent = `LR: ${metrics.lr.toFixed(6)}`;
         if (metrics.buffer_games !== undefined)
             document.getElementById('sum-buf').textContent = `Buffer: ${metrics.buffer_games}`;
+        if (metrics.arena_elo !== undefined) {
+            currentArenaElo = metrics.arena_elo;
+            document.getElementById('sum-arena-elo').textContent = `Arena Elo: ${Math.round(metrics.arena_elo)}`;
+        }
 
         const elapsed = ((Date.now() - startTime) / 60000).toFixed(1);
         document.getElementById('sum-time').textContent = `运行时间: ${elapsed}min`;
