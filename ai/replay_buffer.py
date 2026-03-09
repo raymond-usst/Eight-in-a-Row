@@ -17,6 +17,7 @@ import threading
 from typing import List, Tuple, Optional, Dict, Any
 
 from ai.log_utils import get_logger
+from ai.fast_board import replay_board_from_snapshot, build_local_obs
 
 _log = get_logger(__name__)
 
@@ -129,7 +130,7 @@ class ReplayBuffer:
         # Storage (Chunked)
         self.active_chunk: List[GameHistory] = []
         self.chunk_cache: Dict[int, List[GameHistory]] = {}
-        self.max_cache_chunks = 10
+        self.max_cache_chunks = max(10, (self.max_size // 1000) * 2)  # Enough to cache the entire buffer
         self.chunk_size = 1000
         self.chunk_id_counter = 0
 
@@ -140,9 +141,24 @@ class ReplayBuffer:
         self.total_games = 0           # Monotonic counter of all games ever added
         self._eviction_count = 0       # Total games evicted across lifetime
 
+        # ── Vectorized sampling arrays (pre-allocated with capacity doubling) ──
+        # Avoids O(n) np.append copies. Uses _arr_len to track logical size.
+        self._arr_capacity = 1024
+        self._arr_len = 0
+        self._quality_arr = np.empty(self._arr_capacity, dtype=np.float64)
+        self._gamelen_arr = np.empty(self._arr_capacity, dtype=np.float64)
         # Cached sampling weights (invalidated on any mutation)
         self._sampling_weights: Optional[np.ndarray] = None
         self._weights_dirty = True
+
+        # Active chunk version counter for lock-free snapshot
+        self._active_chunk_version = 0
+        self._active_chunk_snapshot = []
+        self._active_chunk_snapshot_version = -1
+
+        # Timing instrumentation for sample_batch
+        self._batch_call_count = 0
+        self._batch_timing = {'lock': 0.0, 'sample': 0.0, 'total': 0.0}
 
         # Thread safety: protects self.meta and active_chunk against concurrent accesses
         self._data_lock = threading.Lock()
@@ -154,6 +170,8 @@ class ReplayBuffer:
             self.chunk_cache.clear()
             self.meta = []
             self.total_memory = 0
+            self._quality_arr = np.empty(0, dtype=np.float64)
+            self._gamelen_arr = np.empty(0, dtype=np.float64)
             self._sampling_weights = None
             self._weights_dirty = True
             
@@ -178,31 +196,39 @@ class ReplayBuffer:
         if n == 0:
             return 256  # Minimal empty-object overhead
 
-        # Numpy array sizes (measured from actual data)
-        policy_bytes = sum(p.nbytes for p in game.policy_targets)
+        # Numpy array sizes — use .nbytes directly on arrays (O(1) instead of summing elements)
+        pt = game.policy_targets
+        if isinstance(pt, np.ndarray):
+            policy_bytes = pt.nbytes
+        elif len(pt) > 0:
+            policy_bytes = sum(p.nbytes for p in pt)
+        else:
+            policy_bytes = 0
 
         # Board snapshots (100x100 int8 = 10KB each)
         snapshots = getattr(game, 'board_snapshots', {})
         snapshot_bytes = sum(s.nbytes for s in snapshots.values()) if snapshots else 0
 
         target_centers = getattr(game, 'target_centers_precomputed', None)
-        if target_centers is not None and len(target_centers) > 0:
-            precomputed_bytes = len(target_centers) * 8
+        if target_centers is not None:
+            if isinstance(target_centers, np.ndarray):
+                precomputed_bytes = target_centers.nbytes
+            elif len(target_centers) > 0:
+                precomputed_bytes = len(target_centers) * 8
+            else:
+                precomputed_bytes = 0
         else:
             precomputed_bytes = 0
 
-        # Python scalar objects per step:
-        #   action(int~28) + reward(float~24) + root_value(float~24)
-        #   + player_id(int~28) + center(tuple~72) + 7 list-ptrs(~56)
-        scalar_bytes = n * 232
+        # Per-step overhead for remaining arrays (actions, rewards, root_values, etc.)
+        # After _save_game_locked converts to numpy, these are compact.
+        per_step = 40  # conservative estimate for numpy-backed storage
+        scalar_bytes = n * per_step
 
-        # Base object overhead (GameHistory + lists + bool + Optional + dicts)
-        base_overhead = 1024
+        # Base object overhead + metadata fields
+        base_overhead = 1280
 
-        # Additional metadata fields (rankings, placement_rewards, session_scores, etc.)
-        metadata_bytes = 256
-
-        return policy_bytes + snapshot_bytes + precomputed_bytes + scalar_bytes + metadata_bytes + base_overhead
+        return policy_bytes + snapshot_bytes + precomputed_bytes + scalar_bytes + base_overhead
 
     # ================================================================
     #  Quality Scoring
@@ -237,20 +263,22 @@ class ReplayBuffer:
         recency_s = np.exp(-age / 5000.0)
         score += self.W_RECENCY * recency_s
 
-        # ── 4. Policy sharpness: low entropy = decisive MCTS ──
+        # ── 4. Policy sharpness: low entropy = decisive MCTS (vectorized) ──
         sharpness_s = 0.5  # Default if can't compute
         if len(game.policy_targets) > 0 and game_len > 0:
             try:
                 sample_idx = np.linspace(0, game_len - 1, min(5, game_len), dtype=int)
-                entropies = []
-                for i in sample_idx:
-                    p = np.asarray(game.policy_targets[i], dtype=np.float64)
-                    p = np.nan_to_num(p, nan=1e-12, posinf=1.0, neginf=1e-12)
-                    p = np.clip(p, 1e-12, 1.0)
-                    # Only compute entropy for p > 0 to avoid log(0) / NaN warnings
-                    entropies.append(-np.sum(np.where(p > 0, p * np.log(p), 0.0)))
-                avg_entropy = np.mean(entropies)
-                max_entropy = np.log(len(game.policy_targets[0]))  # log(441) ≈ 6.09
+                # Batch: stack sampled policies into (K, A) matrix
+                if isinstance(game.policy_targets, np.ndarray):
+                    sampled = game.policy_targets[sample_idx].astype(np.float64)
+                else:
+                    sampled = np.array([game.policy_targets[i] for i in sample_idx], dtype=np.float64)
+                sampled = np.nan_to_num(sampled, nan=1e-12, posinf=1.0, neginf=1e-12)
+                sampled = np.clip(sampled, 1e-12, 1.0)
+                # Vectorized entropy: -sum(p * log(p)) per row
+                entropies = -np.sum(np.where(sampled > 0, sampled * np.log(sampled), 0.0), axis=1)
+                avg_entropy = entropies.mean()
+                max_entropy = np.log(sampled.shape[1])  # log(441) ≈ 6.09
                 sharpness_s = max(0.0, 1.0 - avg_entropy / max_entropy) if max_entropy > 0 else 0.5
             except Exception:
                 pass
@@ -269,33 +297,25 @@ class ReplayBuffer:
 
     @staticmethod
     def _precompute_focus_data(game: GameHistory):
-        """Precompute target_centers for every position.
+        """Precompute target_centers for every position (vectorized).
         Called once at save_game() time.
-        Target centers are stored for ALL positions (negligible).
         """
         BOARD_SIZE = getattr(game, 'board_size', 100)
         VIEW_SIZE = 21
         HALF = VIEW_SIZE // 2
         n = len(game)
         if n == 0:
-            game.target_centers_precomputed = []
+            game.target_centers_precomputed = np.array([], dtype=np.int32)
             return
 
-        target_centers = []
-
-        for i in range(n):
-            # Compute target center (global board coords of the actual move)
-            act = game.actions[i]
-            ctr = game.centers[i]
-            lr = act // VIEW_SIZE
-            lc = act % VIEW_SIZE
-            tr = ctr[0] - HALF + lr
-            tc = ctr[1] - HALF + lc
-            tr = max(0, min(BOARD_SIZE - 1, tr))
-            tc = max(0, min(BOARD_SIZE - 1, tc))
-            target_centers.append(tr * BOARD_SIZE + tc)
-
-        game.target_centers_precomputed = target_centers
+        # Vectorized computation — no Python loop
+        actions = np.asarray(game.actions, dtype=np.int32)
+        centers = np.asarray(game.centers, dtype=np.int32)  # (n, 2)
+        lr = actions // VIEW_SIZE
+        lc = actions % VIEW_SIZE
+        tr = np.clip(centers[:, 0] - HALF + lr, 0, BOARD_SIZE - 1)
+        tc = np.clip(centers[:, 1] - HALF + lc, 0, BOARD_SIZE - 1)
+        game.target_centers_precomputed = (tr * BOARD_SIZE + tc).astype(np.int32)
 
     def save_game(self, game: GameHistory, training_step: int = 0):
         """Add a completed game with quality scoring and memory-aware eviction.
@@ -315,13 +335,22 @@ class ReplayBuffer:
             game.root_values = np.array(game.root_values, dtype=np.float16)
             game.threats = np.array(game.threats, dtype=np.float16)
             game.player_ids = np.array(game.player_ids, dtype=np.int8)
-            game.target_centers_precomputed = np.array(game.target_centers_precomputed, dtype=np.int32)
+            if not isinstance(game.centers, np.ndarray):
+                game.centers = np.array(game.centers, dtype=np.int32)
+            if not isinstance(game.target_centers_precomputed, np.ndarray):
+                game.target_centers_precomputed = np.array(game.target_centers_precomputed, dtype=np.int32)
+
+        # Ensure step-0 board snapshot exists (avoids fallback to replay_start=0 in sample_batch)
+        if 0 not in game.board_snapshots:
+            bs = getattr(game, 'board_size', 100)
+            game.board_snapshots[0] = np.zeros((bs, bs), dtype=np.int8)
 
         mem = self._estimate_game_memory(game)
         
         # Meta tracks where this game lives
         chunk_idx = len(self.active_chunk)
         chunk_id = self.chunk_id_counter
+        game_len = len(game)
         
         meta = {
             'chunk_id': chunk_id,
@@ -331,7 +360,7 @@ class ReplayBuffer:
             'memory_bytes': mem,
             'quality': 0.0,
             'timestamp': time.time(),
-            'game_len': len(game), # Used for priorities without loading game
+            'game_len': game_len,
         }
         meta['quality'] = self._compute_quality(game, meta)
 
@@ -340,6 +369,22 @@ class ReplayBuffer:
         self.meta.append(meta)
         self.total_memory += mem
         self._weights_dirty = True
+        self._active_chunk_version += 1
+        
+        # O(1) amortized insertion into pre-allocated arrays (no np.append copy!)
+        idx = self._arr_len
+        if idx >= self._arr_capacity:
+            new_cap = self._arr_capacity * 2
+            new_q = np.empty(new_cap, dtype=np.float64)
+            new_g = np.empty(new_cap, dtype=np.float64)
+            new_q[:idx] = self._quality_arr[:idx]
+            new_g[:idx] = self._gamelen_arr[:idx]
+            self._quality_arr = new_q
+            self._gamelen_arr = new_g
+            self._arr_capacity = new_cap
+        self._quality_arr[idx] = meta['quality']
+        self._gamelen_arr[idx] = float(game_len)
+        self._arr_len = idx + 1
         
         # Flush chunk to disk if full
         if len(self.active_chunk) >= self.chunk_size:
@@ -394,27 +439,19 @@ class ReplayBuffer:
         if n_candidates <= 0:
             return
 
-        # Re-score candidates
+        # Re-score candidates — vectorized recency update
+        insert_idxs = np.array([self.meta[i].get('insert_idx', 0) for i in range(n_candidates)], dtype=np.float64)
+        ages = np.maximum(0, self.total_games - insert_idxs)
+        recency_new = np.exp(-ages / 5000.0)
+        old_ages = np.maximum(0, self.total_games - 1 - insert_idxs)
+        recency_old = np.exp(-old_ages / 5000.0)
+        
         scored = []
         for i in range(n_candidates):
-            # We must pass something for game. Only length+winner is used in _compute_quality...
-            # Actually, _compute_quality requires 'game' object which is on disk!
-            # Let's pass a dummy game object or just rely on the stored quality to save I/O.
-            # Recency relies only on meta. Maturity relies on meta.
-            # Length relies on len(game). Outcome relies on game.winner.
-            # Sharpness relies on game.policy_targets.
-            # We update ONLY the recency to avoid loading the chunk.
-            age = max(0, self.total_games - self.meta[i].get('insert_idx', 0))
-            recency_s = np.exp(-age / 5000.0)
-            
-            # Reconstruct estimated quality by subtracting old recency and adding new
-            old_age = max(0, self.total_games - 1 - self.meta[i].get('insert_idx', 0))
-            old_recency_s = np.exp(-old_age / 5000.0)
-            
-            base_quality = self.meta[i]['quality'] - self.W_RECENCY * old_recency_s
-            new_quality = base_quality + self.W_RECENCY * recency_s
+            base_quality = self.meta[i]['quality'] - self.W_RECENCY * recency_old[i]
+            new_quality = base_quality + self.W_RECENCY * recency_new[i]
             self.meta[i]['quality'] = new_quality
-            
+            self._quality_arr[i] = new_quality
             scored.append((i, new_quality, self.meta[i]['memory_bytes']))
 
         # Sort by quality ascending (worst first)
@@ -480,6 +517,16 @@ class ReplayBuffer:
         self.meta = new_meta
         self.total_memory -= freed
         self._weights_dirty = True
+        
+        # Rebuild vectorized arrays from surviving meta
+        new_n = len(new_meta)
+        self._quality_arr = np.empty(max(new_n * 2, 1024), dtype=np.float64)
+        self._gamelen_arr = np.empty(max(new_n * 2, 1024), dtype=np.float64)
+        self._arr_capacity = max(new_n * 2, 1024)
+        self._arr_len = new_n
+        for i, m in enumerate(new_meta):
+            self._quality_arr[i] = m['quality']
+            self._gamelen_arr[i] = m.get('game_len', 1)
 
         avg_quality_evicted = np.mean([scored[j][1] for j in range(evicted)]) if evicted > 0 else 0
         avg_quality_kept = np.mean([m['quality'] for m in self.meta]) if self.meta else 0
@@ -507,7 +554,7 @@ class ReplayBuffer:
     # ================================================================
 
     def _get_sampling_weights(self) -> np.ndarray:
-        """Compute normalized sampling weights for prioritized replay."""
+        """Compute normalized sampling weights for prioritized replay (vectorized, O(1)-like)."""
         n = len(self.meta)
         if n == 0:
             return np.array([], dtype=np.float64)
@@ -516,18 +563,15 @@ class ReplayBuffer:
             if len(self._sampling_weights) == n:
                 return self._sampling_weights
 
-        # Weight = quality^alpha * sqrt(game_length)
-        weights = np.empty(n, dtype=np.float64)
-        for i in range(n):
-            q = max(0.01, self.meta[i].get('quality', 0.01))
-            gl = max(1, self.meta[i].get('game_len', 1))
-            weights[i] = (q ** self.priority_alpha) * np.sqrt(gl)
+        # Vectorized: use parallel numpy arrays instead of Python loop
+        q = np.maximum(self._quality_arr[:n], 0.01)
+        gl = np.maximum(self._gamelen_arr[:n], 1.0)
+        weights = np.power(q, self.priority_alpha) * np.sqrt(gl)
 
-        # Stability: avoid division by zero or numerical blowup when normalizing
+        # Stability: avoid division by zero
         total = weights.sum()
         if total > 0:
-            total = max(total, 1e-9)
-            weights /= total
+            weights *= (1.0 / max(total, 1e-9))
         else:
             weights[:] = 1.0 / n
 
@@ -541,7 +585,9 @@ class ReplayBuffer:
         """
         Sample a batch of positions with prioritized experience replay.
         """
-        # Snapshot metadata under lock
+        t_total_start = time.perf_counter()
+        # Snapshot metadata under lock — avoid O(n) list copy
+        t_lock_start = time.perf_counter()
         with self._data_lock:
             n = len(self.meta)
             if n == 0:
@@ -550,9 +596,17 @@ class ReplayBuffer:
                 "Ensure buffer has games before calling sample_batch."
             )
             weights = self._get_sampling_weights()
-            meta_snapshot = list(self.meta)
-            active_chunk_snapshot = list(self.active_chunk)
+            # Lightweight snapshot: reference the list (meta dicts are append-only;
+            # only 'quality' mutates but that's safe for sampling purposes)
+            meta_ref = self.meta
+            meta_len = n
+            # Fast active chunk snapshot with version check (avoids list() copy when unchanged)
+            if self._active_chunk_snapshot_version != self._active_chunk_version:
+                self._active_chunk_snapshot = list(self.active_chunk)
+                self._active_chunk_snapshot_version = self._active_chunk_version
+            active_chunk_snapshot = self._active_chunk_snapshot
             current_chunk_id = self.chunk_id_counter
+        t_lock_end = time.perf_counter()
 
         batch_obs, batch_next_obs, batch_actions, batch_target_values = [], [], [], []
         batch_target_rewards, batch_target_policies, batch_global_states = [], [], []
@@ -563,7 +617,9 @@ class ReplayBuffer:
         game_indices = np.random.choice(n, size=batch_size, p=weights, replace=True)
 
         for gi in game_indices:
-            game_meta = meta_snapshot[gi]
+            if gi >= meta_len:
+                continue
+            game_meta = meta_ref[gi]
             cid = game_meta['chunk_id']
             cidx = game_meta['chunk_idx']
             
@@ -645,59 +701,50 @@ class ReplayBuffer:
             if snap_step in game.board_snapshots:
                 current_board = game.board_snapshots[snap_step].copy()
                 replay_start = snap_step
+            elif 0 in game.board_snapshots:
+                current_board = game.board_snapshots[0].copy()
+                replay_start = 0
             else:
                 current_board = np.zeros((BOARD_SIZE, BOARD_SIZE), dtype=np.int8)
                 replay_start = 0
 
-            # Efficiency: replay from snapshot to pos (max ~SNAPSHOT_INTERVAL steps) instead of full game.
-            for i in range(replay_start, pos):
-                act = game.actions[i]
-                ctr = game.centers[i]
-                lr = act // VIEW_SIZE
-                lc = act % VIEW_SIZE
-                br = ctr[0] - HALF + lr
-                bc = ctr[1] - HALF + lc
-                pid = game.player_ids[i]
-                if 0 <= br < BOARD_SIZE and 0 <= bc < BOARD_SIZE:
-                    current_board[br, bc] = pid
+            # C-accelerated board replay from snapshot to pos
+            if replay_start < pos:
+                _actions = game.actions if isinstance(game.actions, np.ndarray) else np.asarray(game.actions)
+                _pids = game.player_ids if isinstance(game.player_ids, np.ndarray) else np.asarray(game.player_ids)
+                if hasattr(game, '_centers_r'):
+                    _centers_r = game._centers_r
+                    _centers_c = game._centers_c
+                else:
+                    _centers_arr = np.asarray(game.centers)
+                    _centers_r = _centers_arr[:, 0] if _centers_arr.ndim == 2 else np.array([c[0] for c in game.centers])
+                    _centers_c = _centers_arr[:, 1] if _centers_arr.ndim == 2 else np.array([c[1] for c in game.centers])
+                replay_board_from_snapshot(
+                    current_board, _actions, _centers_r, _centers_c, _pids,
+                    replay_start, pos, VIEW_SIZE, BOARD_SIZE
+                )
 
-            # --- Dynamic Sub-Observation Reconstruction ---
-            # Now that current_board perfectly matches the exact 100x100 global state at `pos`:
+            # --- Dynamic Sub-Observation Reconstruction (C-accelerated) ---
             current_pid = game.player_ids[pos]
             next_pid = (current_pid % 3) + 1
             prev_pid = ((current_pid + 1) % 3) + 1
             
-            # Create rotated planes dict based on the board exactly as get_observation() expects
+            cpos = game.centers[pos]
+            obs_local = build_local_obs(
+                current_board, cpos[0], cpos[1],
+                current_pid, next_pid, prev_pid, VIEW_SIZE, BOARD_SIZE
+            )
+            
+            # Global thumbnail
             rotated_planes = {
                 1: (current_board == current_pid),
                 2: (current_board == next_pid),
                 3: (current_board == prev_pid),
                 0: (current_board == 0),
             }
-            
             from ai.game_env import EightInARowEnv
             if not hasattr(self, '_obs_env') or self._obs_env.BOARD_SIZE != BOARD_SIZE:
                 self._obs_env = EightInARowEnv(board_size=BOARD_SIZE)
-            
-            # Since get_observation expects `env.board`, we recreate the view dynamically
-            # without carrying an `env` instance by manually cropping the planes:
-            cpos = game.centers[pos]
-            r_start = cpos[0] - HALF
-            c_start = cpos[1] - HALF
-            
-            # Build the 4x21x21 local obs matrix entirely synthetically
-            chans = []
-            for plane_key in [1, 2, 3, 0]: # ME, NEXT, PREV, EMPTY
-                plane = rotated_planes[plane_key]
-                padded_plane = np.pad(plane, pad_width=HALF, mode='constant', constant_values=0)
-                # Translate original coordinates to padded coordinates
-                p_r_start = r_start + HALF
-                p_c_start = c_start + HALF
-                crop = padded_plane[p_r_start : p_r_start + VIEW_SIZE, p_c_start : p_c_start + VIEW_SIZE]
-                chans.append(crop)
-            obs_local = np.stack(chans, axis=0).astype(np.float32)
-            
-            # Global thumbnail
             rot_stack = np.stack([rotated_planes[1], rotated_planes[2], rotated_planes[3], rotated_planes[0]], axis=0).astype(np.float32)
             obs_global = self._obs_env._numpy_area_pool(rot_stack, VIEW_SIZE)
             obs_array = np.concatenate([obs_local, obs_global], axis=0)
@@ -721,26 +768,20 @@ class ReplayBuffer:
                 next_active_pid = game.player_ids[pos + 1]
                 n_next_pid = (next_active_pid % 3) + 1
                 n_prev_pid = ((next_active_pid + 1) % 3) + 1
+                
+                # C-accelerated local obs construction
+                cpos_next = game.centers[pos + 1]
+                obs_local_next = build_local_obs(
+                    current_board, cpos_next[0], cpos_next[1],
+                    next_active_pid, n_next_pid, n_prev_pid, VIEW_SIZE, BOARD_SIZE
+                )
+                
                 rotated_planes_next = {
                     1: (current_board == next_active_pid),
                     2: (current_board == n_next_pid),
                     3: (current_board == n_prev_pid),
                     0: (current_board == 0),
                 }
-                cpos_next = game.centers[pos + 1]
-                r_start_n = cpos_next[0] - HALF
-                c_start_n = cpos_next[1] - HALF
-                
-                chans_n = []
-                for plane_key in [1, 2, 3, 0]:
-                    plane_n = rotated_planes_next[plane_key]
-                    padded_plane_n = np.pad(plane_n, pad_width=HALF, mode='constant', constant_values=0)
-                    p_r_start_n = r_start_n + HALF
-                    p_c_start_n = c_start_n + HALF
-                    crop_n = padded_plane_n[p_r_start_n : p_r_start_n + VIEW_SIZE, p_c_start_n : p_c_start_n + VIEW_SIZE]
-                    chans_n.append(crop_n)
-                obs_local_next = np.stack(chans_n, axis=0).astype(np.float32)
-                
                 rot_stack_next = np.stack([rotated_planes_next[1], rotated_planes_next[2], rotated_planes_next[3], rotated_planes_next[0]], axis=0).astype(np.float32)
                 obs_global_next = self._obs_env._numpy_area_pool(rot_stack_next, VIEW_SIZE)
                 obs_next_array = np.concatenate([obs_local_next, obs_global_next], axis=0)
@@ -830,7 +871,7 @@ class ReplayBuffer:
             batch_player_ids.append(game.player_ids[pos])
             batch_insert_idxs.append(game_meta.get('insert_idx', -1))
 
-        return {
+        result = {
             'observations': np.array(batch_obs, dtype=np.float32),
             'next_observations': np.array(batch_next_obs, dtype=np.float32),
             'actions': np.array(batch_actions, dtype=np.int64),
@@ -847,6 +888,22 @@ class ReplayBuffer:
             'insert_idxs': np.array(batch_insert_idxs, dtype=np.int64),
         }
 
+        # Timing instrumentation
+        t_total_end = time.perf_counter()
+        self._batch_call_count += 1
+        self._batch_timing['lock'] += t_lock_end - t_lock_start
+        self._batch_timing['total'] += t_total_end - t_total_start
+        if self._batch_call_count % 50 == 0:
+            avg_total = self._batch_timing['total'] / self._batch_call_count
+            avg_lock = self._batch_timing['lock'] / self._batch_call_count
+            print(f"[ReplayBuffer] Batch timing (avg over {self._batch_call_count} calls): "
+                  f"total={avg_total:.3f}s, lock={avg_lock:.4f}s, "
+                  f"per_sample={avg_total/batch_size*1000:.1f}ms, "
+                  f"games={len(self.meta)}",
+                  flush=True)
+
+        return result
+
     def update_priorities(self, insert_idxs: np.ndarray, errors: np.ndarray):
         """Update quality score of games based on TD errors from training."""
         with self._data_lock:
@@ -860,12 +917,15 @@ class ReplayBuffer:
                 
             updated = False
             # Reverse iterate as sampled games are statistically more likely to be recent
-            for m in reversed(self.meta):
+            for meta_i in range(len(self.meta) - 1, -1, -1):
+                m = self.meta[meta_i]
                 idx = m.get('insert_idx', -1)
                 if idx in max_errs:
-                    # Blend old quality with TD error proxy
-                    # TD error is typically > 0. We clip at 1.0 to fit the quality [0, 1] scheme.
-                    m['quality'] = 0.5 * m.get('quality', 0.5) + 0.5 * min(1.0, max_errs[idx])
+                    new_q = 0.5 * m.get('quality', 0.5) + 0.5 * min(1.0, max_errs[idx])
+                    m['quality'] = new_q
+                    # Sync vectorized array
+                    if meta_i < self._arr_len:
+                        self._quality_arr[meta_i] = new_q
                     updated = True
                     del max_errs[idx]
                     if not max_errs:
@@ -1095,6 +1155,15 @@ class ReplayBuffer:
                 self._weights_dirty = True
                 self.active_chunk = []
                 self.chunk_cache.clear()
+                # Rebuild pre-allocated vectorized arrays from loaded meta
+                loaded_n = len(self.meta)
+                self._arr_capacity = max(loaded_n * 2, 1024)
+                self._arr_len = loaded_n
+                self._quality_arr = np.empty(self._arr_capacity, dtype=np.float64)
+                self._gamelen_arr = np.empty(self._arr_capacity, dtype=np.float64)
+                for i, m in enumerate(self.meta):
+                    self._quality_arr[i] = m.get('quality', 0.01)
+                    self._gamelen_arr[i] = m.get('game_len', 1)
             else:
                 _log.warning("Loading legacy monolithic buffer. Initiating format migration...")
                 self.active_chunk = []

@@ -23,7 +23,7 @@ class EightInARowEnv:
     PLACEMENT_POINTS = (5, 2, 0)
     PLACEMENT_REWARDS = (1.0, -0.2, -1.0)
 
-    def __init__(self, board_size: int = 100, win_length: int = 8):
+    def __init__(self, board_size: int = 100, win_length: int = 8, max_steps: Optional[int] = None):
         board_size = int(board_size)
         win_length = int(win_length)
         if board_size < 3 or board_size > 200:
@@ -37,6 +37,8 @@ class EightInARowEnv:
             )
         self.BOARD_SIZE = board_size
         self.WIN_LENGTH = win_length
+        # Cap game length to avoid GPU OOM and recompile thrashing (e.g. 100x100 -> 250 steps)
+        self._max_steps = max_steps
         
         self.board = np.zeros((self.BOARD_SIZE, self.BOARD_SIZE), dtype=np.int8)
         self.current_player = 0  # index into PLAYER_IDS
@@ -89,7 +91,7 @@ class EightInARowEnv:
 
     def clone(self) -> 'EightInARowEnv':
         """Create a deep copy of this environment."""
-        env = EightInARowEnv(board_size=self.BOARD_SIZE, win_length=self.WIN_LENGTH)
+        env = EightInARowEnv(board_size=self.BOARD_SIZE, win_length=self.WIN_LENGTH, max_steps=self._max_steps)
         env.board = self.board.copy()
         env.current_player = self.current_player
         env.move_history = list(self.move_history)
@@ -201,6 +203,12 @@ class EightInARowEnv:
             self.winner = pid
             self.rank_players()
             reward = 1.0
+        elif self._max_steps is not None and len(self.move_history) >= self._max_steps:
+            # Round limit (e.g. 250 for 100x100) — force draw to avoid ultra-long games and GPU OOM
+            self.done = True
+            self.winner = None
+            self._rank_draw()
+            reward = 0.0
         elif not np.any(self._player_planes[3]):
             # Board full — draw (no empty cells remain)
             self.done = True

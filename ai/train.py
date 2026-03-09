@@ -72,13 +72,15 @@ def load_metrics_log(path):
     return METRICS_LOG
 
 def start_ws_server(port: int = 5001):
-    """Start WebSocket server in background thread."""
+    """Start WebSocket server in background thread. Prints only after server is bound or on error."""
     try:
         import websockets
         import websockets.server
     except ImportError:
         print("[Dashboard] websockets not installed, run: pip install websockets")
         return
+
+    started_ok = threading.Event()
 
     async def handler(websocket):
         WS_CLIENTS.add(websocket)
@@ -96,16 +98,22 @@ def start_ws_server(port: int = 5001):
         WS_LOOP = asyncio.get_event_loop()
         try:
             async with websockets.serve(handler, "0.0.0.0", port):
+                started_ok.set()
                 await asyncio.Future()
-        except OSError:
-            print(f"[Dashboard] Port {port} in use, skipping WS server")
+        except OSError as e:
+            if "Address already in use" in str(e) or e.errno == 98 or e.errno == 10048:
+                print(f"[Dashboard] 端口 {port} 已被占用，仪表盘不可用。可指定其它端口: python -m ai.train_async --ws-port 5002")
+            else:
+                print(f"[Dashboard] WebSocket 启动失败: {e}")
 
     def _thread_target():
         asyncio.run(run_server())
 
     t = threading.Thread(target=_thread_target, daemon=True)
     t.start()
-    print(f"[Dashboard] WebSocket server on ws://0.0.0.0:{port} — open train_dashboard.html to monitor (pip install websockets if missing)")
+    if started_ok.wait(timeout=3.0):
+        print(f"[Dashboard] WebSocket 已就绪 ws://0.0.0.0:{port} — 打开 train_dashboard.html 并连接此地址即可监控")
+    # else: server may still be starting or port in use (run_server will print)
 
 
 def broadcast(event_type: str, data: dict):
@@ -140,6 +148,8 @@ def train(config: MuZeroConfig, args):
     device = torch.device(config.device if torch.cuda.is_available() else "cpu")
     if device.type == "cuda":
         torch.cuda.manual_seed_all(config.seed)
+        # Enable cuDNN autotuner for fixed-size conv inputs
+        torch.backends.cudnn.benchmark = True
     print(f"Device: {device}")
     
     start_ws_server(port=args.ws_port)
@@ -154,10 +164,13 @@ def train(config: MuZeroConfig, args):
     opponent_network.eval()
 
     # Optimizer
+    # Fused AdamW: single CUDA kernel per step
+    _fused = device.type == 'cuda'
     optimizer = torch.optim.AdamW(
         network.parameters(),
         lr=config.learning_rate,
-        weight_decay=config.weight_decay
+        weight_decay=config.weight_decay,
+        fused=_fused
     )
     # Sync train: StepLR (+ optional warmup). Async train uses LambdaLR (warmup + cosine).
     scheduler = torch.optim.lr_scheduler.StepLR(
@@ -293,7 +306,8 @@ def train(config: MuZeroConfig, args):
         sp_start = time.time()
         network.eval()
         
-        if replay_buffer.num_games() < config.min_buffer_size:
+        current_min = config.min_buffer_size if global_step == 0 else config.min_buffer_games
+        if replay_buffer.num_games() < current_min:
             # Warmup phase: strictly self-play to fill buffer
             nets = network
             is_eval = False
@@ -368,7 +382,8 @@ def train(config: MuZeroConfig, args):
         print(f" done ({sp_time:.1f}s)")
 
         # ---- Phase 2: Training ----
-        if replay_buffer.num_games() < config.min_buffer_size:
+        current_min = config.min_buffer_size if global_step == 0 else config.min_buffer_games
+        if replay_buffer.num_games() < current_min:
             continue
 
         network.train()
@@ -463,20 +478,22 @@ def train(config: MuZeroConfig, args):
 
 
 def _update_memory_bank(memory_bank, game, network, device, config):
-    """Save key positions from game to memory bank."""
+    """Save key positions from game to memory bank. Processes in fixed-size chunks to avoid GPU OOM and recompile thrashing."""
     # Store e.g. every 5th step
-    indices = range(0, len(game), 5)
-    if len(indices) == 0: return
+    indices = list(range(0, len(game), 5))
+    if len(indices) == 0:
+        return
 
     from ai.game_env import EightInARowEnv
     from ai.self_play import _get_observation_and_mask
     import numpy as np
-    env = EightInARowEnv(board_size=getattr(game, 'board_size', config.board_size), 
+
+    env = EightInARowEnv(board_size=getattr(game, 'board_size', config.board_size),
                          win_length=getattr(game, 'win_length', config.win_length))
     env.reset()
     h_half = config.local_view_size // 2
     obs_dict = {}
-    
+
     max_idx = max(indices)
     for i in range(max_idx + 1):
         if i in indices:
@@ -485,39 +502,34 @@ def _update_memory_bank(memory_bank, game, network, device, config):
             _, legal_mask = env.get_legal_moves_and_mask(ctr[0], ctr[1], config.local_view_size)
             obs, _, _ = _get_observation_and_mask(env, config, ctr[0], ctr[1], legal_mask, rotated)
             obs_dict[i] = obs
-            
+
         act = game.actions[i]
         ctr = game.centers[i]
         lr, lc = act // config.local_view_size, act % config.local_view_size
         env.step(ctr[0] - h_half + lr, ctr[1] - h_half + lc)
-        
-    obs_batch = np.array([obs_dict[i] for i in indices])
-    obs_tensor = torch.from_numpy(obs_batch).to(device)
-    
+
+    # Chunk size to avoid VRAM spike and dynamic-shape recompiles (fixed batch size per chunk)
+    chunk_size = getattr(config, 'memory_bank_chunk_size', 64)
     with torch.no_grad():
-        # Get hidden states (keys)
-        hidden_states = network.representation(obs_tensor)
-        
-        # Get value embeddings (values)
-        values = []
-        rewards = []
-        for i in indices:
-            values.append(game.root_values[i])
-            rewards.append(game.rewards[i])
-        
-        val_batch = np.array(values, dtype=np.float32)
-        rew_batch = np.array(rewards, dtype=np.float32)
-        
-        val_tensor = torch.from_numpy(val_batch).to(device)
-        rew_tensor = torch.from_numpy(rew_batch).to(device)
-        
-        # [value, reward, max_logit]
-        vals = torch.zeros(len(indices), config.hidden_state_dim, device=device)
-        vals[:, 0] = val_tensor[:, 0] # Take V_me (root player value) from vector
-        vals[:, 1] = rew_tensor
-        # vals[:, 2] = 0.0
-    
-    memory_bank.write(hidden_states, vals)
+        for start in range(0, len(indices), chunk_size):
+            chunk_indices = indices[start : start + chunk_size]
+            obs_batch = np.array([obs_dict[i] for i in chunk_indices])
+            obs_tensor = torch.from_numpy(obs_batch).to(device)
+
+            hidden_states = network.representation(obs_tensor)
+
+            values = [game.root_values[i] for i in chunk_indices]
+            rewards = [game.rewards[i] for i in chunk_indices]
+            val_batch = np.array(values, dtype=np.float32)
+            rew_batch = np.array(rewards, dtype=np.float32)
+            val_tensor = torch.from_numpy(val_batch).to(device)
+            rew_tensor = torch.from_numpy(rew_batch).to(device)
+
+            vals = torch.zeros(len(chunk_indices), config.hidden_state_dim, device=device)
+            vals[:, 0] = val_tensor[:, 0]
+            vals[:, 1] = rew_tensor
+
+            memory_bank.write(hidden_states, vals)
 
 
 def train_step(network, optimizer, scaler, batch, config, device, memory_bank,
@@ -576,17 +588,19 @@ def train_step(network, optimizer, scaler, batch, config, device, memory_bank,
     if 'session_contexts' in batch:
         session_contexts = _to_dev('session_contexts')
 
-    # ── Batch data NaN/Inf validation ──
-    validation_tensors = [('obs', obs), ('target_values', target_values),
-                          ('target_rewards', target_rewards), ('target_policies', target_policies),
-                          ('global_states', global_states), ('target_heatmaps', target_heatmaps),
-                          ('target_threats', target_threats), ('target_opponent_actions', target_opponent_actions)]
-    if session_contexts is not None:
-        validation_tensors.append(('session_contexts', session_contexts))
-    for name, t in validation_tensors:
-        if torch.isnan(t).any() or torch.isinf(t).any():
-            return {'total': float('nan'), 'value': 0.0, 'reward': 0.0,
-                    'policy': 0.0, 'consistency': 0.0, 'focus': 0.0, '_nan': True}
+    # ── Batch data NaN/Inf validation (every 50 steps to reduce overhead) ──
+    # The per-step loss NaN guard below catches any NaN that slips through.
+    if step_counter % 50 == 0:
+        validation_tensors = [('obs', obs), ('target_values', target_values),
+                              ('target_rewards', target_rewards), ('target_policies', target_policies),
+                              ('global_states', global_states), ('target_heatmaps', target_heatmaps),
+                              ('target_threats', target_threats), ('target_opponent_actions', target_opponent_actions)]
+        if session_contexts is not None:
+            validation_tensors.append(('session_contexts', session_contexts))
+        for name, t in validation_tensors:
+            if torch.isnan(t).any() or torch.isinf(t).any():
+                return {'total': float('nan'), 'value': 0.0, 'reward': 0.0,
+                        'policy': 0.0, 'consistency': 0.0, 'focus': 0.0, '_nan': True}
 
     # Phase 6: KOTH Gradient Masking
     loss_mask = 1.0
@@ -604,7 +618,7 @@ def train_step(network, optimizer, scaler, batch, config, device, memory_bank,
     target_rewards = target_rewards.clamp(-5.0, 5.0)
 
     if not accumulate:
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
 
     with torch.amp.autocast('cuda', dtype=torch.bfloat16):  # Enable BF16 Mixed Precision for 30-50% speedup
         # 1. Initial Representation
@@ -758,7 +772,7 @@ def train_step(network, optimizer, scaler, batch, config, device, memory_bank,
     # ── NaN guard: skip step if loss is NaN/Inf ──
     # Always zero_grad on NaN regardless of accumulate, to prevent poison gradients
     if torch.isnan(total_loss) or torch.isinf(total_loss):
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
         return {'total': float('nan'), 'value': 0.0, 'reward': 0.0,
                 'policy': 0.0, 'consistency': 0.0, 'focus': 0.0, 'policy_entropy': 0.0, 'recon': 0.0, '_nan': True}
 
@@ -774,7 +788,7 @@ def train_step(network, optimizer, scaler, batch, config, device, memory_bank,
                 has_nan_grad = True
                 break
         if has_nan_grad:
-            optimizer.zero_grad()  # always clear poison gradients
+            optimizer.zero_grad(set_to_none=True)  # always clear poison gradients
             scaler.update()
             return {'total': float('nan'), 'value': 0.0, 'reward': 0.0,
                     'policy': 0.0, 'consistency': 0.0, 'focus': 0.0, 'policy_entropy': 0.0, 'recon': 0.0, '_nan': True, 'td_errors': None}

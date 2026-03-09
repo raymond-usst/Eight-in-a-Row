@@ -328,11 +328,23 @@ def _batch_simulate_phase(root: MCTSNode, sim_queue: List[Tuple[int, 'MCTSNode']
                     priors_logits = policy_logits_batch[k].detach()
                     priors = F.softmax(priors_logits, dim=0).cpu().numpy()
                     raw_logits = priors_logits.cpu().numpy()
-                    for a_idx in range(config.policy_size):
-                        if priors[a_idx] > 1e-6:
-                            leaf_node.children[a_idx] = MCTSNode(
-                                prior=float(priors[a_idx]), logit=float(raw_logits[a_idx])
-                            )
+                    
+                    # Top-K pruning: only create nodes for the K most probable actions
+                    # to avoid creating up to 441 MCTSNode objects per leaf expansion
+                    _TOP_K = 32
+                    if len(priors) > _TOP_K:
+                        top_indices = np.argpartition(priors, -_TOP_K)[-_TOP_K:]
+                        for a_idx in top_indices:
+                            if priors[a_idx] > 1e-8:
+                                leaf_node.children[int(a_idx)] = MCTSNode(
+                                    prior=float(priors[a_idx]), logit=float(raw_logits[a_idx])
+                                )
+                    else:
+                        for a_idx in range(len(priors)):
+                            if priors[a_idx] > 1e-6:
+                                leaf_node.children[int(a_idx)] = MCTSNode(
+                                    prior=float(priors[a_idx]), logit=float(raw_logits[a_idx])
+                                )
                     if not leaf_node.children:
                         best_a = int(priors.argmax())
                         leaf_node.children[best_a] = MCTSNode(

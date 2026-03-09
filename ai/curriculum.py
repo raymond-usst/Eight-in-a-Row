@@ -43,11 +43,11 @@ class CurriculumManager:
         self.base_games = getattr(config, 'curriculum_base_games', 10000)
         self.base_size = 15 * 15  # 225
 
-        # Initialize Stages with Fixed Step Counts: 500 -> 1000 -> 1500 -> infinity
+        # Initialize Stages with Fixed Step Counts: 10000 -> 25000 -> 50000 -> infinity
         self.stages = [
-            CurriculumStage(stage_id=1, board_size=15, win_length=5, min_steps=500),
-            CurriculumStage(stage_id=2, board_size=30, win_length=6, min_steps=1000),
-            CurriculumStage(stage_id=3, board_size=50, win_length=7, min_steps=1500),
+            CurriculumStage(stage_id=1, board_size=15, win_length=5, min_steps=10000),
+            CurriculumStage(stage_id=2, board_size=30, win_length=6, min_steps=25000),
+            CurriculumStage(stage_id=3, board_size=50, win_length=7, min_steps=50000),
             CurriculumStage(stage_id=4, board_size=100, win_length=8, min_steps=99999999)
         ]
         

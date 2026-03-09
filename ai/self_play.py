@@ -137,7 +137,16 @@ def play_game(network: Union[torch.nn.Module, Dict[int, torch.nn.Module]], confi
     board_size = board_size_override if board_size_override is not None else config.board_size
     win_length = win_length_override if win_length_override is not None else config.win_length
 
-    env = EightInARowEnv(board_size=board_size, win_length=win_length)
+    # Cap game length by board size to avoid GPU OOM and recompile thrashing (100x100 -> 250, etc.)
+    max_game_steps_cfg = getattr(config, 'max_game_steps', 5000)
+    if board_size >= 50:
+        max_steps_env = min(max_game_steps_cfg, 250)
+    elif board_size >= 30:
+        max_steps_env = min(max_game_steps_cfg, 180)
+    else:
+        max_steps_env = min(max_game_steps_cfg, 150)
+
+    env = EightInARowEnv(board_size=board_size, win_length=win_length, max_steps=max_steps_env)
     env.reset()
     history = GameHistory()
     history.board_size = board_size

@@ -19,7 +19,9 @@ _log = get_logger(__name__)
 
 VIEW_SIZE = 21
 
-
+# ================================================================
+#  Permutation cache (precomputed at module load — avoids per-sample 441-loop)
+# ================================================================
 def _rot90_ccw(r: int, c: int, k: int, size: int) -> Tuple[int, int]:
     """Apply k*90° counter-clockwise rotation. (r,c) in [0, size-1]."""
     if k == 0:
@@ -46,35 +48,38 @@ def _inv_rot90_ccw(r: int, c: int, k: int, size: int) -> Tuple[int, int]:
     return r, c
 
 
+def _build_action_perms(view_size: int) -> Dict[Tuple[int, int], Tuple[np.ndarray, np.ndarray]]:
+    """Precompute (inv_perm, fwd_perm) for all 8 (rot, mirror) combinations."""
+    action_size = view_size * view_size
+    cache = {}
+    for rot in range(4):
+        for mirror in range(2):
+            inv_perm = np.zeros(action_size, dtype=np.int32)
+            fwd_perm = np.zeros(action_size, dtype=np.int32)
+            for new_r in range(view_size):
+                for new_c in range(view_size):
+                    r1, c1 = new_r, view_size - 1 - new_c if mirror else new_c
+                    old_r, old_c = _inv_rot90_ccw(r1, c1, rot, view_size)
+                    old_idx = old_r * view_size + old_c
+                    new_idx = new_r * view_size + new_c
+                    inv_perm[new_idx] = old_idx
+                    fwd_perm[old_idx] = new_idx
+            cache[(rot, mirror)] = (inv_perm, fwd_perm)
+    return cache
+
+
+# Module-level cache: computed once at import time (~0.5ms)
+_PERM_CACHE: Dict[Tuple[int, int], Tuple[np.ndarray, np.ndarray]] = _build_action_perms(VIEW_SIZE)
+
+
 def _action_inv_perm_21(rot: int, mirror: int) -> np.ndarray:
-    """
-    For 21x21 local action space: after we apply (rot, mirror) to the view,
-    new_policy[new_idx] = old_policy[old_idx] where (old_r, old_c) maps to (new_r, new_c).
-    Returns inv_perm[441] so that new_policy = old_policy[inv_perm].
-    """
-    inv_perm = np.zeros(VIEW_SIZE * VIEW_SIZE, dtype=np.int32)
-    for new_r in range(VIEW_SIZE):
-        for new_c in range(VIEW_SIZE):
-            r1, c1 = new_r, VIEW_SIZE - 1 - new_c if mirror else new_c
-            old_r, old_c = _inv_rot90_ccw(r1, c1, rot, VIEW_SIZE)
-            old_idx = old_r * VIEW_SIZE + old_c
-            new_idx = new_r * VIEW_SIZE + new_c
-            inv_perm[new_idx] = old_idx
-    return inv_perm
+    """Cached inverse permutation lookup."""
+    return _PERM_CACHE[(rot, mirror)][0]
 
 
 def _action_fwd_perm_21(rot: int, mirror: int) -> np.ndarray:
-    """Forward perm: old_idx -> new_idx. new_action = fwd_perm[old_action]."""
-    fwd = np.zeros(VIEW_SIZE * VIEW_SIZE, dtype=np.int32)
-    for old_r in range(VIEW_SIZE):
-        for old_c in range(VIEW_SIZE):
-            new_r, new_c = _rot90_ccw(old_r, old_c, rot, VIEW_SIZE)
-            if mirror:
-                new_c = VIEW_SIZE - 1 - new_c
-            old_idx = old_r * VIEW_SIZE + old_c
-            new_idx = new_r * VIEW_SIZE + new_c
-            fwd[old_idx] = new_idx
-    return fwd
+    """Cached forward permutation lookup."""
+    return _PERM_CACHE[(rot, mirror)][1]
 
 
 def _center_transform(row: int, col: int, board_size: int, rot: int, mirror: int) -> Tuple[int, int]:
@@ -97,7 +102,7 @@ def _transform_spatial_nd(x: np.ndarray, rot: int, mirror: int) -> np.ndarray:
 def apply_observation_noise(
     batch: Dict[str, np.ndarray], rng: np.random.Generator, std: float = 0.02
 ) -> None:
-    """Add Gaussian noise to observations and next_observations. Clips to [0, 1]. In-place."""
+    """Add Gaussian noise to observations and next_observations (vectorized). In-place."""
     if std <= 0:
         return
     if batch is None or not isinstance(batch, dict):
@@ -105,12 +110,15 @@ def apply_observation_noise(
     obs = batch.get('observations')
     if obs is None or not isinstance(obs, np.ndarray) or obs.size == 0:
         raise ValueError("batch['observations'] must be a non-empty numpy array")
-    B = obs.shape[0]
-    for b in range(B):
-        noise = rng.normal(0, std, batch['observations'][b].shape).astype(np.float32)
-        batch['observations'][b] = np.clip(batch['observations'][b] + noise, 0.0, 1.0)
-        noise_next = rng.normal(0, std, batch['next_observations'][b].shape).astype(np.float32)
-        batch['next_observations'][b] = np.clip(batch['next_observations'][b] + noise_next, 0.0, 1.0)
+    
+    # Vectorized: generate noise for entire batch at once
+    noise = rng.normal(0, std, obs.shape).astype(np.float32)
+    np.clip(obs + noise, 0.0, 1.0, out=batch['observations'])
+    
+    next_obs = batch.get('next_observations')
+    if next_obs is not None and isinstance(next_obs, np.ndarray) and next_obs.size > 0:
+        noise_next = rng.normal(0, std, next_obs.shape).astype(np.float32)
+        np.clip(next_obs + noise_next, 0.0, 1.0, out=batch['next_observations'])
 
 
 def apply_board_augment(
@@ -120,8 +128,8 @@ def apply_board_augment(
 ) -> None:
     """
     Apply random rotation (0/90/180/270°) and horizontal mirror to each sample in the batch.
-    Optionally add Gaussian noise to observations (noise_std > 0).
-    Modifies batch in place. Uses VIEW_SIZE=21 for actions and batch['global_states'].shape[-1] for board.
+    Optimized: uses precomputed permutation cache and batched numpy operations.
+    Modifies batch in place.
     """
     if batch is None or not isinstance(batch, dict):
         raise ValueError("batch must be a non-empty dict")
@@ -136,14 +144,18 @@ def apply_board_augment(
     board_size = gs.shape[-1]
     action_size = view_size * view_size
 
+    # Generate all random transforms at once
+    rots = rng.integers(0, 4, size=B)
+    mirrors = rng.integers(0, 2, size=B)
+
     for b in range(B):
-        rot = int(rng.integers(0, 4))
-        mirror = int(rng.integers(0, 2))
+        rot = int(rots[b])
+        mirror = int(mirrors[b])
         if rot == 0 and mirror == 0:
             continue
 
-        inv_perm = _action_inv_perm_21(rot, mirror)
-        fwd_perm = _action_fwd_perm_21(rot, mirror)
+        # Use precomputed permutations (O(1) lookup instead of 441-iteration loop)
+        inv_perm, fwd_perm = _PERM_CACHE[(rot, mirror)]
 
         # Observations (B, C, H, W) and next_observations
         batch['observations'][b] = _transform_spatial_nd(batch['observations'][b], rot, mirror)
@@ -151,17 +163,13 @@ def apply_board_augment(
         # Global states (B, 4, board_size, board_size)
         batch['global_states'][b] = _transform_spatial_nd(batch['global_states'][b], rot, mirror)
 
-        # Actions (B, K): old index -> new index via fwd_perm
-        K = batch['actions'].shape[1]
-        for k in range(K):
-            a = int(batch['actions'][b, k])
-            if 0 <= a < action_size:
-                batch['actions'][b, k] = fwd_perm[a]
+        # Actions (B, K): vectorized via fancy indexing
+        acts = batch['actions'][b]
+        valid = (acts >= 0) & (acts < action_size)
+        acts[valid] = fwd_perm[acts[valid]]
 
-        # Target policies (B, K+1, action_size): new_policy = old_policy[inv_perm]
-        for k in range(batch['target_policies'].shape[1]):
-            old_p = batch['target_policies'][b, k]
-            batch['target_policies'][b, k] = old_p[inv_perm]
+        # Target policies (B, K+1, action_size): vectorized via fancy indexing
+        batch['target_policies'][b] = batch['target_policies'][b][:, inv_perm]
 
         # Target center: single int (row*board_size+col)
         flat = int(batch['target_centers'][b])
@@ -169,11 +177,10 @@ def apply_board_augment(
         nr, nc = _center_transform(row, col, board_size, rot, mirror)
         batch['target_centers'][b] = nr * board_size + nc
 
-        # Target opponent actions: old index -> new index
+        # Target opponent actions: vectorized
         oa = int(batch['target_opponent_actions'][b])
         if 0 <= oa < action_size:
             batch['target_opponent_actions'][b] = fwd_perm[oa]
-        # -1 for terminal stays -1
 
         # Target heatmaps (B, 21, 21)
         batch['target_heatmaps'][b] = _transform_spatial_nd(

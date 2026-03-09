@@ -42,7 +42,11 @@ class InferenceClient:
 
         self.socket.send_multipart(parts)
         
-        reply_parts = self.socket.recv_multipart()
+        # Poll for reply instead of blocking infinitely so KeyboardInterrupts (Ctrl+C) can be caught by the Python interpreter
+        while True:
+            if self.socket.poll(100): # timeout 100ms
+                reply_parts = self.socket.recv_multipart()
+                break
         
         # Parse replies
         results = []

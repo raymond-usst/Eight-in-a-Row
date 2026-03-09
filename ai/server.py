@@ -96,6 +96,14 @@ async def get_move(req: MoveRequest):
         env.board = board_arr
         player_idx = req.current_player - 1
         env.current_player = player_idx
+        
+        # Manually reconstruct _player_planes since step() wasn't called
+        env._player_planes[0] = (env.board == 1).astype(np.float32)
+        env._player_planes[1] = (env.board == 2).astype(np.float32)
+        env._player_planes[2] = (env.board == 3).astype(np.float32)
+        env._player_planes[3] = (env.board == 0).astype(np.float32)
+        env._planes_dirty = True
+        
         occupied = np.argwhere(env.board != 0)
         if len(occupied) > 0:
             env._min_r = int(occupied[:, 0].min())
@@ -193,6 +201,14 @@ async def websocket_move(websocket: WebSocket):
         env.board = board_arr
         player_idx = req.current_player - 1
         env.current_player = player_idx
+        
+        # Manually reconstruct _player_planes since step() wasn't called
+        env._player_planes[0] = (env.board == 1).astype(np.float32)
+        env._player_planes[1] = (env.board == 2).astype(np.float32)
+        env._player_planes[2] = (env.board == 3).astype(np.float32)
+        env._player_planes[3] = (env.board == 0).astype(np.float32)
+        env._planes_dirty = True
+        
         occupied = np.argwhere(env.board != 0)
         if len(occupied) > 0:
             env._min_r = int(occupied[:, 0].min())

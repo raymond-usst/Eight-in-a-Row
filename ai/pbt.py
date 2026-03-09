@@ -173,7 +173,8 @@ class Population:
         if not os.path.exists(path):
             return
         try:
-            payload = torch.load(path, map_location='cpu', weights_only=True)
+            # Checkpoint may contain numpy scalars in hyperparams/stats; use weights_only=False for trusted own checkpoints
+            payload = torch.load(path, map_location='cpu', weights_only=False)
             self.generation = payload.get('generation', 0)
             agent_data = payload.get('agents', [])
             if not isinstance(agent_data, list):
