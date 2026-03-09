@@ -183,9 +183,9 @@ def eval_worker(config, stop_event, shared_model, weights_version, weights_lock,
     from ai.arena import run_arena_match
     import os
     
-    # We don't want the eval worker to fight over GPU memory with actors and learner,
-    # but since it's just inference, we can put it on CPU or use CUDA if free.
-    device = torch.device('cpu') 
+    # Use CUDA if available, CPU otherwise.
+    # GPU significantly accelerates evaluation, preventing the dashboard from lagging by an hour.
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')  
     
     model_current = MuZeroNetwork(config).to(device)
     model_past = MuZeroNetwork(config).to(device)
@@ -193,8 +193,16 @@ def eval_worker(config, stop_event, shared_model, weights_version, weights_lock,
     model_past.eval()
     
     local_version = -1
-    eval_interval = 1000
-    next_eval_step = eval_interval
+    eval_interval = 200 # <-- Changed temporarily to 200 for faster visibility
+    
+    # Wait for Learner to initialize shared_stats (especially when resuming)
+    while shared_stats.total_steps.value == 0 and not stop_event.is_set():
+        time.sleep(1.0)
+        
+    current_step = shared_stats.total_steps.value
+    next_eval_step = (current_step // eval_interval + 1) * eval_interval
+    
+    print(f"[Eval Worker] Initialized at step {current_step}. Next evaluation at step {next_eval_step}.")
     
     # Initialize past model with starting weights
     with weights_lock:
@@ -211,9 +219,9 @@ def eval_worker(config, stop_event, shared_model, weights_version, weights_lock,
                 model_current.load_state_dict(shared_model.state_dict())
                 local_version = weights_version.value
             
-            # Run matches (e.g., 30 games) 
-            # We use a relatively low simulation count for speed on CPU
-            results = run_arena_match(model_current, model_past, config, num_games=30, temp=0.1, verbose=False)
+            # Run matches
+            # We pass model_past as A (Baseline) and model_current as B (New).
+            results = run_arena_match(model_past, model_current, config, num_games=16, temp=0.1, verbose=True)
             
             # Update Elo (Accumulative based on winrate)
             elo_diff = results["elo_diff"]
@@ -222,7 +230,7 @@ def eval_worker(config, stop_event, shared_model, weights_version, weights_lock,
                 shared_stats.arena_elo.value += elo_diff
                 current_elo = shared_stats.arena_elo.value
                 
-            print(f"[Eval Worker] Arena Result: B wins {results['wins_b']}, A wins {results['wins_a']}, Draws {results['draws']}. "
+            print(f"[Eval Worker] Arena Result: Current wins {results['wins_b']}, Past wins {results['wins_a']}, Draws {results['draws']}. "
                   f"WinRate: {results['win_rate_b']*100:.1f}%. Elo Diff: {elo_diff:+.1f}. New Arena Elo: {current_elo:.1f}")
                   
             # The current model is now the 'past' model for the next interval
