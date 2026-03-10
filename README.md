@@ -1,174 +1,276 @@
-# 八子棋 MuZero：原理说明、算法流程与操作指南
+# 三人八子棋 (Trifeet v2) - MuZero 强化学习系统
 
-三人八子棋（Eight-in-a-Row）的 MuZero 训练与对弈系统：基于 MuZero + Gumbel 搜索 + DeepSeek MLA 骨干，支持课程学习、联赛、PBT、Engram 记忆与 EfficientZero 一致性损失。
+本项目是一个基于 **MuZero** 和 **Gumbel MCTS** 的三人八子棋（Eight-in-a-Row）人工智能训练与对弈系统。系统集成了 **DeepSeek MLA** 骨干网络、**EfficientZero** 隐状态一致性、**Engram** 外部情节记忆等先进特性，并支持课程学习（Curriculum Learning）、基于种群的训练（PBT）和自我对弈联赛（Self-Play League）。
 
-**主要功能**：同步/异步训练、FastAPI AI 对弈服务、WebSocket 训练监控台。
-
----
-
-## 一、原理说明
-
-### 1.1 游戏与环境
-
-- **棋盘与规则**：棋盘大小为 S×S（如 100×100），三名玩家（1=红、2=绿、3=蓝）轮流落子，先连成 `win_length`（如 8）子者获胜。步奖励：非终局为 0，获胜时为 1（当前玩家）；终局按名次使用 `placement_rewards`（如 1st +1.0、2nd -0.2、3rd -1.0）用于价值目标。
-- **状态与动作**：动作空间为局部视野的离散格点，大小为 `local_view_size²`（如 21×21=441），即局部动作索引。观测为**当前玩家视角**的局部视野与全局缩略图（4 通道局部 + 4 通道全局）。详见 [ai/MATH.md](ai/MATH.md)。
-
-### 1.2 MuZero 抽象
-
-- **表示网络**：\( h = \text{representation}(\text{obs}) \)，将观测编码为隐状态。
-- **动力学网络**：\( (h', r) = \text{dynamics}(h, a) \)，由当前隐状态与动作预测下一隐状态与即时奖励。
-- **预测网络**：\( (\text{policy}, \text{value}) = \text{prediction}(h) \)，输出策略分布与价值。
-- **价值语义**：价值为 3 维向量 \((V_{\text{me}}, V_{\text{next}}, V_{\text{prev}})\)，表示在当前状态下三名玩家的期望折扣回报（当前玩家视角），与 n 步 TD 目标一致。
-
-### 1.3 Gumbel MuZero MCTS
-
-与标准 PUCT 的差异：
-
-1. **根节点**：对先验 logits 加 Gumbel(0,1) 噪声，增强探索。
-2. **Sequential Halving**：从 top-m 个动作出发，多轮减半候选，用网络评估缩小集合。
-3. **策略改进**：改进策略 \( \bar{\sigma} = \text{softmax}(\text{logits} + c_{\text{scale}} \cdot \text{normalized\_Q}) \)，具有单调改进性质。
-4. **内部节点**：仍使用标准 PUCT 选择；叶节点批量扩展、虚拟损失、回传。
-
-参考文献：Danihelka et al., "Policy improvement by planning with Gumbel" (2022)。实现见 [ai/mcts.py](ai/mcts.py)。
-
-### 1.4 训练目标
-
-- **价值损失**：n 步 TD 目标（向量），MSE；目标由 `_compute_value_target` 计算，含终局 placement 或 bootstrap 旋转。
-- **奖励损失**：步奖励标量，MSE。
-- **策略损失**：MCTS 改进策略与网络策略的交叉熵。
-- **Consistency（EfficientZero）**：预测隐状态与真实下一观测的表示一致性，SimSiam 式 \( 2 - 2\cdot\cos\text{\_sim} \)。
-- **Focus**：聚焦网络（预测落子中心）的辅助损失。
-
-数学细节与约定见 [ai/MATH.md](ai/MATH.md)。
-
-### 1.5 可选模块简述
-
-| 模块 | 说明 |
-|------|------|
-| **Engram** | 外部情节记忆：存储 (key, value)，检索时通过 cross-attention 增强隐状态，使网络可回忆历史局面模式。 |
-| **Curriculum** | 课程学习：分阶段增大棋盘与连子数（如 15×15→30×30→50×50→100×100），按对局数、胜率、损失、可选 Elo 毕业。 |
-| **League** | 联赛：历史对手池 + Elo 评分，按概率采样对手进行对局，提升多样性。 |
-| **PBT** | 种群基于训练：多智能体种群，周期性复制/变异超参（如学习率、权重衰减）。 |
-| **KOTH** | 王座模式：轮流训练“当前玩家”，其余玩家网络冻结，平衡三方强度。 |
+本文档将系统性地阐述各模块的详尽数学原理、核心超参数设定及其物理意义，并提供程序执行的图形化框图与详细描述。
 
 ---
 
-## 二、算法流程
+## 目录
 
-### 2.1 同步训练 (train.py)
+1. [模块详尽数学与算法原理](#1-模块详尽数学与算法原理)
+   - 1.1 状态、动作与价值抽象
+   - 1.2 高阶网络架构设计 (DeepSeek MLA / Engram / EfficientZero)
+   - 1.3 Gumbel MuZero MCTS 搜索逻辑
+   - 1.4 多重损失函数构建
+2. [核心配置参数及其意义](#2-核心配置参数及其意义)
+   - 2.1 游戏与网络参数
+   - 2.2 搜索与探索参数
+   - 2.3 训练与异步并发控制
+3. [程序执行框图与详尽描述](#3-程序执行框图与详尽描述)
+   - 3.1 异步训练系统宏观架构 (train_async)
+   - 3.2 自我对弈数据流 (Actor Loop)
+   - 3.3 Learner 参数更新与展开 (Unroll) 流程
+4. [高级演化模块说明](#4-高级演化模块说明)
+5. [操作与使用指南](#5-操作与使用指南)
 
-循环每轮：
+---
 
-1. **自对弈**：生成 N 局游戏（`play_game` / `run_selfplay`），使用当前网络与 Gumbel MCTS。
-2. **写入 ReplayBuffer**：将每局轨迹（观测、动作、奖励、策略目标、价值目标等）存入 buffer。
-3. **采样与训练**：按质量加权采样 batch，执行 `train_step`（设备转移、张量验证、representation → dynamics → prediction、多损失、反向传播与梯度裁剪）。
-4. **可选**：按间隔保存 checkpoint、更新 curriculum、联赛对手与 Elo。
+## 1. 模块详尽数学与算法原理
 
-### 2.2 异步训练 (train_async.py)
+### 1.1 状态、动作与价值抽象
 
-多进程：多个 **Actor** 进程生成对局，一个 **Learner** 进程在 GPU 上训练并定期更新权重。
+三人博弈环境具备显著的非对称性和局部视野特性。框架使用如下数学抽象：
+
+- **观测状态 (Observation)**: 输入网络的是以当前落子预测点为中心的局部视野（`21×21`）加上全局棋盘的缩略图（共 8 通道）。所有观测严格按 **当前玩家视角** 构建，消除网络对绝对玩家编号的依赖。
+- **动作空间 (Action Space)**: 动作空间被映射为局部视野内的离散格点，大小为 `policy_size = 21 × 21 = 441`。网络只输出在当前关注区域内的先验概率（Prior）。
+- **价值体系 (Value Semantics)**:
+  - 价值 $V$ 表示为三维向量 $(V_{\text{me}}, V_{\text{next}}, V_{\text{prev}})$，分别代表当前玩家、下一顺位玩家、上一顺位玩家在当前状态下的期望折扣回报（Discounted Return）。
+  - 返回的即时奖励 $r$ 是标量（仅当前玩家获奖）。
+  - 终端目标由名次决定，例如第一名 $1.0$，第二名 $-0.2$，第三名 $-1.0$。所有训练过程中的 N步时序差分（n-step TD）均在此三维向量上进行递推与 Bootstrap 旋转预测。
+
+### 1.2 高阶网络架构设计
+
+核心网络 (`MuZeroNetwork`) 在经典的表示（Representation）、动力学（Dynamics）、预测（Prediction）三大结构上叠加了现代模块：
+
+1. **DeepSeek MLA Transformer 骨干**:
+   - 取代传统 ResNet，使用 Multi-Head Latent Attention（多头潜在注意力）处理空间图谱特征，大幅提升在大尺度棋盘（如 100x100）下跨远距离子力的感知与推理能力。
+2. **Engram 发作式记忆 (Episodic Memory)**:
+   - $h^{\text{aug}} = \text{CrossAttention}(h, K_{\text{engram}}, V_{\text{engram}})$。通过关联历史博弈数据特征，动态增强隐状态 $h$，使模型具备类似“死活棋词典”的记忆检索能力。
+3. **EfficientZero 一致性 (Consistency) 与 Focus**:
+   - **Consistency**: 引入 SimSiam 式自监督：预测的下一帧隐状态与实际下个真实观察编码后的隐状态，计算余弦相似度：$\mathcal{L}_{\text{cons}} = 2 - 2\cos\langle \text{proj}(h_{t+1}), \text{proj}(\text{repr}(o_{t+1})) \rangle$。
+   - **Focus Head**: 辅助网络，输入全局缩略图，预测该落子回合应该将“视口中心”放在棋盘的哪里（归一化坐标），用 MSE 损失训练。
+
+### 1.3 Gumbel MuZero MCTS 搜索逻辑
+
+区别于标准 PUCT，为了在根节点强化探索并在小模拟数下获得高质量行动，采用了 **Gumbel MuZero** 算法结合 **Sequential Halving（连续折半）** 搜索：
+
+1. **根节点探索设定**:
+   - 对于网络输出的先验 logits $\pi_{\text{prior}}$，叠加热度衰减的 Gumbel 分布噪声：$\text{logits}^* = \pi_{\text{prior}} + \text{Gumbel}(0, 1)$。
+2. **Sequential Halving**:
+   - 选取 Top-$m$ （例如 16）个动作作为初始根分枝候选。
+   - 每经过一轮深度遍历（批量化 `_batch_simulate_phase` 评价叶节点），淘汰一半动作（Halving），最终收敛到唯一的最优探索路径。
+3. **策略提升 (Policy Improvement)**:
+   - 根据搜索树中累计完成的评估 Q 值（经 MinMax 规范化），生成比网络先验更强的软策略（目标策略）：
+   - $\pi_{\text{target}} = \text{softmax}(\logits^* + c_{\text{scale}} \cdot Q_{\text{normalized}})$。该动作分布用作网络策略头的反向传播的交叉熵标签。
+
+### 1.4 多重损失函数构建
+
+Learner 在进行 $K$ 步展开（Unroll）后，计算并加和各时刻 $k$ 的损失，且除以 $K$ 以保证梯度平稳：
+
+$$ \mathcal{L} = \frac{1}{K} \sum_{k=0}^{K} \Big[ \underbrace{\lambda_v \| \mathbf{V}_k - \mathbf{z}_k \|^2}_{\text{Value (MSE)}} + \underbrace{\lambda_r ( r_k - u_k )^2}_{\text{Reward (MSE)}} - \underbrace{\lambda_\pi \boldsymbol{\pi}_k^{\text{MCTS}} \cdot \log \mathbf{p}_k}_{\text{Policy (CE)}} + \underbrace{\lambda_c (2 - 2\cos(\hat{h}_k, h_k))}_{\text{Consistency}} \Big] + \mathcal{L}_{\text{focus}} $$
+
+其中 $\mathbf{z}_k$ 为基于 N步 TD 计算得到的真实三维价值目标，$\boldsymbol{\pi}_k^{\text{MCTS}}$ 为 Gumbel 提升策略。
+
+---
+
+## 2. 核心配置参数及其意义
+
+在 `ai/muzero_config.py` 中的 `MuZeroConfig` 类统一管理系统超参。以下精选部分关键设定：
+
+### 2.1 游戏与网络结构参数
+
+| 参数名 | 默认值 | 物理意义与设定逻辑 |
+| :--- | :--- | :--- |
+| `board_size` | 100 | 棋盘边长（由课程学习在 15 \to 30 \to 50 \to 100 演进）。|
+| `win_length` | 8 | 连子获胜条件（随阶段从 5 增至 8）。|
+| `observation_channels` | 8 | 网络输入通道：4（局部视野玩家0/1/2+空）+ 4（全局视野缩略信息）。|
+| `hidden_state_dim` | 128 | 隐状态维度。表征能力核心指标，越大代表局面信息容量越高，但推理更慢。|
+| `policy_size` | 441 | `21x21`局部视口的离散动作总数。决定预测网络输出的 logit 分布宽度。|
+| `d_model` / `n_layers` | 256 / 12 | DeepSeek MLA backbone 的 Transformer 维度和层数。决定模型的复杂度和思考深度。|
+
+### 2.2 搜索与探索参数
+
+| 参数名 | 默认值 | 物理意义与设定逻辑 |
+| :--- | :--- | :--- |
+| `num_simulations_early`| 32 | 开局初期（10步以内）MCTS 模拟次数。开局分枝多但容易预判。|
+| `num_simulations_mid` | 100 | 中盘（10-40步）MCTS 模拟次数。局势复杂，需要深宽搜索以提升策略。|
+| `gumbel_c_scale` | 1.0 | 策略改进公式中 Q值 的缩放系数。值越大策略更新越具备“贪心”剥削倾向。|
+| `gumbel_max_considered_actions` | 16 | Gumbel 连续折半的候选基数。在 441 的政策空间中预取前 16 进行精细化树搜索。|
+
+### 2.3 训练与异步调度参数
+
+| 参数名 | 默认值 | 物理意义与设定逻辑 |
+| :--- | :--- | :--- |
+| `batch_size_end` | 1024 | 满载训练批次大小。大 Batch 减少梯度噪音，配合 PBT 调度缓慢增加至此上限。|
+| `num_unroll_steps` | 5 | $\Delta t=5$ 步。单次前向通过 Dynamics 递推的深度，增加它有助于网络长期逻辑一致。|
+| `td_steps` | 10 | 价值目标的 N 步 Bootstrap，$\sum_{i=0}^{10} \gamma^ir + \gamma^{10} V_{i+10}$，权衡偏差与方差。|
+| `max_memory_gb` | 35.0 | ReplayBuffer 的峰值内存管理，利用 psutil 动态探测，达到容量极限时自动剔除老对局防止溢出崩溃。|
+
+---
+
+## 3. 程序执行框图与详尽描述
+
+### 3.1 异步并发架构流 (Macro Architecture)
+
+基于 `ai/train_async.py` 实现的多进程读写解耦构架。
+
+```mermaid
+flowchart TD
+    subgraph Process_Actors ["N × Actor Processes (CPU)"]
+        direction TB
+        A1[Actor_1: Gumbel MCTS\nSelf-Play]
+        A2[Actor_2: Gumbel MCTS\nSelf-Play]
+        AN[Actor_N: Gumbel MCTS\nSelf-Play]
+    end
+
+    subgraph Process_Buffer ["Replay Buffer Process (CPU/RAM)"]
+        direction TB
+        RB[(Game Replay Queue +\nPrioritized Buffer)]
+        Sampler[Batch Sampler Worker]
+        RB -->|Async Thread| Sampler
+    end
+
+    subgraph Process_Learner ["Learner Process (GPU)"]
+        direction TB
+        Prefetch[Batch Prefetcher]
+        Optimizer[Network Forward, Unroll, Loss & Backprop]
+        Prefetch --> Optimizer
+    end
+
+    Process_Actors --"1. Publish Completed Game Dict"--> RB
+    Sampler --"2. Provide Tensor Batch"--> Prefetch
+    Optimizer --"3. Periodic Checkpoint / Weights Sync"--> Share[Shared Memory & Disk Files]
+    Share --"4. Pull Latest Weights"--> Process_Actors
+```
+
+**宏观描述**:
+- 主控制器拉起多个 Actor 进程，并维护一个全局监控看板（通过 WebSocket 推送至前端 dashboard）。
+- **Actor** 不参与梯度流计算，纯粹调用网络做前向计算（或通过 ZeroMQ 发往专门的推理服务器批量化计算）。玩完一局后打包为完整的 Trajectory（状态、动作、改进的策略$\pi$，三维价值$V$）塞入队列。
+- **Learner** 通过一个守护线程不断将发来的游戏载入优先级经验回放池（Prioritized Replay Buffer），并持续执行 `prefetch`，以确保 GPU 的计算不被 I/O 阻塞。
+
+### 3.2 自我对弈数据流 (Actor Loop)
+
+```mermaid
+sequenceDiagram
+    participant Env as Environment
+    participant Actor as Actor (Game Loop)
+    participant MCTS as Gumbel MCTS
+    participant Net as MuZero Network
+
+    Actor->>Env: reset() (Get global board & focus view)
+    loop Until game over or step limit
+        Actor->>MCTS: select_action(obs, memory_engram)
+        MCTS->>Net: initial_inference() (Get root logits, value)
+        MCTS->>MCTS: Add Gumbel noise & Get top-16 actions
+        loop Sequential Halving (log2(16) phases)
+            MCTS->>MCTS: Generate tree paths adding virtual loss
+            MCTS->>Net: recurrent_inference() (Batch evaluate leaves)
+            MCTS->>MCTS: Backpropagate vectors (remove virtual loss)
+        end
+        MCTS-->>Actor: best_action, target_pi, root_value
+        Actor->>Env: step(best_action) (Convert to board x, y)
+        Actor->>Actor: Store (obs, action, target_pi, value) into Trajectory
+    end
+    Actor->>Actor: rank_players() -> set final placement rewards (TD targets)
+    Actor->>GlobalQueue: Send completed game trajectory
+```
+
+**自我对弈关键行为**: 
+在每一手对弈前，网络通过 Focus 模块快速锁定区域。随后 MCTS 通过虚拟损失（Virtual Loss）打破线程搜索壁垒，批量对各个动作子叶进行 `recurrent_inference()`。完成 N 层折半后生成目标软策略数组（Target Pi）。并在整局结束时，逆序反推（Bootstrap/TD）填写每一帧最终期望的价值矩阵。
+
+### 3.3 Learner 参数更新与展开流程 (Unroll)
 
 ```mermaid
 flowchart LR
-  subgraph actors [Actors]
-    A1[Actor 1]
-    A2[Actor 2]
-    AN[Actor N]
-  end
-  Q[game_queue]
-  L[Learner]
-  SM[shared_model]
-  actors -->|completed games| Q
-  Q --> L
-  L -->|weights| SM
-  SM -->|read weights| actors
+    Start([Batch from ReplayBuffer])
+    obs[o_0: 初始观测]
+    acts[a_0, a_1 ... a_{K-1}: 动作序列]
+    targs[Target: Value, Reward, Policy]
+
+    obs --> initial[Net.initial_inference: o_0 -> h_0, p_0, v_0]
+    
+    initial --> compute_loss_0[Compute Loss t=0]
+    targs -.-> compute_loss_0
+    
+    subgraph K_Steps_Unroll [Unroll K Steps (e.g., K=5)]
+        direction TB
+        Dynamics["Net.recurrent(h_{k}, a_k) \n -> h_{k+1}, r_{k}"]
+        Predict["Net.prediction(h_{k+1}) \n -> p_{k+1}, v_{k+1}"]
+        Dynamics --> Predict
+    end
+    
+    initial --> K_Steps_Unroll
+    acts --> K_Steps_Unroll
+    
+    K_Steps_Unroll --> compute_loss_k[Compute Loss t > 0]
+    targs -.-> compute_loss_k
+    
+    compute_loss_0 --> Add[Sum & Scale by 1/K]
+    compute_loss_k --> Add
+    Add --> Backprop[Backward & Optimizer Step]
 ```
 
-- **Actor 循环**：(1) 从共享内存或文件加载最新权重；(2) 可选加载 curriculum/league/KOTH 状态；(3) 自对弈一局或多局；(4) 将完成的对局放入 `game_queue`。
-- **Learner 循环**：(1) 从 `game_queue` 取游戏；(2) 写入 ReplayBuffer 并做合法性/预计算；(3) 预取下一 batch（pin_memory）；(4) `train_step`；(5) 按间隔 checkpoint、更新 curriculum/league/PBT；(6) 将新权重写回共享内存，供 Actor 读取。
-
-### 2.3 单步 train_step 数据流
-
-1. **前向**：observation → representation →（可选 engram read）→ prediction（policy, value, aux）；session context 可注入隐状态。
-2. **Unroll**：对 K 步使用 dynamics + prediction，得到各步价值、奖励、策略。
-3. **损失**：value（MSE）+ reward（MSE）+ policy（CE）+ consistency（2−2·cos_sim）+ focus（辅助）。
-4. **反向**：梯度缩放（unroll 步 1/K）、梯度裁剪（max_grad_norm）、optimizer.step。
+**更新细则**:
+从经验缓冲池获取的数据不是独立帧，而是长度达 `unroll_steps(K)` 的连续轨迹。
+网络以观测起跑得到隐状态 $h_0$。此后仅使用缓存的过往动作 $a_t$ 结合 Dynamics 网络“推演”出 $h_{1\dots K}$（期间无真实画面交互）。每一层的预测 $(v_k, p_k, r_{k-1})$ 分别与重放数组里实际计算的 $(z_k, \pi_k, u_{k-1})$ 执行对应的损失计算。这不仅训练评估模块，更倒逼 Dynamics 模型学懂游戏环境的基本运转规律。
 
 ---
 
-## 三、操作使用指南
+## 4. 高级演化模块说明
 
-### 3.1 环境依赖
+本代码库不仅实现了本体 MuZero，在其之上更配置了多种大模型级别的调度器与演进模块：
 
-- **Python**：3.x。
-- **依赖安装**（依赖在 `ai/requirements.txt`）：
-  ```bash
-  pip install -r ai/requirements.txt
-  ```
-  主要包含：`torch`、`numpy`、`fastapi`、`uvicorn`。
-- **可选**：`websockets`（训练监控台）、`psutil`（ReplayBuffer 系统内存紧急驱逐）。
-
-从项目根目录执行上述命令；若将 `ai/requirements.txt` 复制到根目录为 `requirements.txt`，也可使用 `pip install -r requirements.txt`。
-
-### 3.2 同步训练
-
-```bash
-python -m ai.train [--steps 1000] [--resume] [--checkpoint-dir checkpoints] [--cpu] [--batch-size 512] [--lr 1e-3] [--selfplay-games 10] [--simulations 100] [--min-buffer 100] [--stage 1|2|3|4] [--board-size N] [--win-length K] [--ws-port 5001]
-```
-
-- `--stage`：课程阶段（1=15×15/5 子，2=30×30/6 子，3=50×50/7 子，4=100×100/8 子）。
-- `--resume`：从 `checkpoint_dir/latest.pt` 恢复训练与 buffer。
-- `--ws-port`：训练监控台 WebSocket 端口，默认 5001。
-
-### 3.3 异步训练
-
-```bash
-python -m ai.train_async [--steps 100000] [--actors 8] [--resume] [--min-buffer 100] [--batch-size 512] [--lr 1e-3] [--simulations 100] [--max-memory 35] [--auto-curriculum] [--koth-mode] [--koth-period 10000] [--pbt-pop-size 4] [--checkpoint-interval 500]
-```
-
-- 检查点目录默认 **checkpoints_async**；入口会调用 `config.validate()`。
-- `--auto-curriculum`：启用自动课程进阶；`--koth-mode`：王座模式；`--pbt-pop-size`：PBT 种群大小。
-
-### 3.4 AI 对弈服务
-
-```bash
-python -m ai.server [--model checkpoints/best_model.pt] [--port 5000] [--host 0.0.0.0] [--cpu]
-```
-
-- **GET /api/status**：模型是否加载、路径、设备、参数量。
-- **POST /api/move**：请求体 `board`（100×100）、`current_player`（1/2/3）、`move_history`；返回落子 `(row, col)`、置信度、思考时间、可选 `root_value` 与 `top_actions`。
-
-### 3.5 训练监控台
-
-- 用浏览器打开项目根目录下的 **train_dashboard.html**，在页面中连接 WebSocket（默认 `ws://localhost:5001`）。
-- 同步训练时需保证 `--ws-port 5001`（或与页面中填写的端口一致）；异步训练默认已开启 5001。
-- **若无法连接**：先安装 `pip install websockets`；若训练在远程或 WSL 运行，将地址改为 `ws://<主机IP>:5001`。
-- 功能：实时自对弈棋盘、累计胜率（红/绿/蓝/平局）、名次分布、训练指标与损失曲线等。
-
-### 3.6 配置与检查点
-
-- **配置**：完整字段与默认值见 [ai/muzero_config.py](ai/muzero_config.py) 中的 `MuZeroConfig`；训练与 server 的入口脚本通过命令行参数覆盖部分字段。
-- **检查点**：
-  - 同步：`checkpoint_dir`（默认 `checkpoints`）下的 `latest.pt`、`best_model.pt` 等。
-  - 异步：`checkpoints_async` 下的 `shared_weights.pt`、`shared_memory.pt`、`latest.pt` 等。
-- 规模与上限（buffer、队列、演员数等）见 [ai/SCALABILITY.md](ai/SCALABILITY.md)。
-
-### 3.7 常见参数速查
-
-| 类别 | 参数示例 |
-|------|----------|
-| 训练 | `steps`, `batch_size`, `learning_rate`, `num_simulations`, `td_steps`, `num_unroll_steps`, `discount` |
-| 规模 | `replay_buffer_size`, `max_memory_gb`, `min_buffer_games`, `game_queue_maxsize`, `actors`, `prefetch_workers` |
-| 课程/联赛/PBT | `auto_curriculum`, `league_opponent_prob`, `pbt_population_size`, `pbt_period` |
+- **课程学习 (Curriculum.py)**: 因为直接让模型在 `100×100` 八子连线的稀疏奖励空间学习是不可突破的。环境初始设定为 `15×15` 的 5连子，当监控线程探测到近期 100 局胜率/Loss符合阈值或按训练步数达标后，发送事件通知所有 Actor 扩展棋盘（转为阶段2：`30x30/6子`，依此类推）。这被称为 *Curriculum Transition*。
+- **PBT (Population Based Training)**: 异步训练框架不仅训练一套权重，同时在硬盘挂载整个“种群”。每隔 `pbt_period`，若某个亚种模型表现落后，将强行将其权重和超参（如 `lr`, `discount`）重写覆盖为优势种群的变异版本，避免局部最优解。
+- **KOTH 王座模式 (King of the Hill)**: 在三人非对称博弈下极易造成死循环死锁策略。KOTH开启时，训练焦点仅锁定一位玩家视角，将另外两位视角替换为不同历史版本参数，强迫 Focus 玩家提升对抗任意体系的硬实力。每 `N` 步轮换一次王座。
+- **联赛制度 (League.py)**: `Self-Play` 中以 `league_opponent_prob (e.g., 0.2)` 提取过往时代的 checkpoint 作为对手。以 ELO 打分体系判定自身在历史维度上的绝对跨越。
 
 ---
 
-## 四、目录与进阶文档
+## 5. 操作与使用指南
 
-- **根目录**：`train_dashboard.html`（训练监控台）、`README.md`（本文件）、`ai/`（核心实现）。
-- **进阶阅读**：
-  - [ai/MAINTENANCE.md](ai/MAINTENANCE.md)：各组件维护约束与不可删除项。
-  - [ai/MATH.md](ai/MATH.md)：状态/动作/价值/MCTS/训练公式的数学约定。
-  - [ai/REUSABILITY.md](ai/REUSABILITY.md)：公共 API 与组件复用方式。
-  - [ai/SCALABILITY.md](ai/SCALABILITY.md)：规模相关配置与调参。
-  - [ai/EFFICIENCY.md](ai/EFFICIENCY.md)：已有效率措施与保留建议。
+### 5.1 环境部署
+
+运行在 Python 3 平台，推荐 CUDA 环境。
+
+```bash
+# 安装必要依赖
+pip install -r ai/requirements.txt
+```
+*主要库：`torch`, `numpy`, `fastapi`, `websockets`, `uvicorn`, `psutil`.*
+
+### 5.2 启动异步训练 (最高效)
+
+适用于多核 CPU + GPU 服务器。默认开启全部优化（包括课程进阶、多进程经验收集等）：
+
+```bash
+python -m ai.train_async \
+    --steps 500000 \
+    --actors 8 \
+    --batch-size 512 \
+    --lr 5e-4 \
+    --auto-curriculum \
+    --koth-mode \
+    --koth-period 10000 
+```
+
+如果要从上次中断位置恢复：
+```bash
+python -m ai.train_async --resume
+```
+
+### 5.3 启动实时训练看板 (Web Dashboard)
+
+在开始任何训练后（默认开启 `ws://localhost:5001` WebSocket 通信）：
+1. 在浏览器直接打开代码目录中的 `train_dashboard.html`。
+2. 将展现红/绿/蓝胜率走势、即时棋盘动效、各类 Loss 的平滑收敛样态。
+
+### 5.4 快速发起推理推演 (AI Web Server)
+
+可使用已导出的最好模型启动 REST/FastAPI 对弈端：
+
+```bash
+python -m ai.server --model checkpoints_async/best_model.pt --port 5000
+```
+- **请求动作推演 (POST /api/move)**：传入 `(board:List[List], current_player: int)`。返回 AI 的落子点、Gumbel 思考用时和最佳胜率估算值。
