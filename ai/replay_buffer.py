@@ -170,8 +170,10 @@ class ReplayBuffer:
             self.chunk_cache.clear()
             self.meta = []
             self.total_memory = 0
-            self._quality_arr = np.empty(0, dtype=np.float64)
-            self._gamelen_arr = np.empty(0, dtype=np.float64)
+            self._arr_capacity = 1024
+            self._arr_len = 0
+            self._quality_arr = np.empty(self._arr_capacity, dtype=np.float64)
+            self._gamelen_arr = np.empty(self._arr_capacity, dtype=np.float64)
             self._sampling_weights = None
             self._weights_dirty = True
             

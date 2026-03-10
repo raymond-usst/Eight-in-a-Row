@@ -202,7 +202,7 @@ def eval_worker(config, stop_event, shared_model, weights_version, weights_lock,
     current_step = shared_stats.total_steps.value
     next_eval_step = (current_step // eval_interval + 1) * eval_interval
     
-    print(f"[Eval Worker] Initialized at step {current_step}. Next evaluation at step {next_eval_step}.")
+    _log.info("[Eval Worker] Initialized at step %s. Next evaluation at step %s.", current_step, next_eval_step)
     
     # Initialize past model with starting weights
     with weights_lock:
@@ -212,7 +212,7 @@ def eval_worker(config, stop_event, shared_model, weights_version, weights_lock,
     while not stop_event.is_set():
         current_step = shared_stats.total_steps.value
         if current_step >= next_eval_step:
-            print(f"[Eval Worker] Step {current_step} reached. Starting Arena Evaluation...")
+            _log.info("[Eval Worker] Step %s reached. Starting Arena Evaluation...", current_step)
             
             # Sync current model
             with weights_lock:
@@ -230,8 +230,10 @@ def eval_worker(config, stop_event, shared_model, weights_version, weights_lock,
                 shared_stats.arena_elo.value += elo_diff
                 current_elo = shared_stats.arena_elo.value
                 
-            print(f"[Eval Worker] Arena Result: Current wins {results['wins_b']}, Past wins {results['wins_a']}, Draws {results['draws']}. "
-                  f"WinRate: {results['win_rate_b']*100:.1f}%. Elo Diff: {elo_diff:+.1f}. New Arena Elo: {current_elo:.1f}")
+            _log.info("[Eval Worker] Arena Result: Current wins %s, Past wins %s, Draws %s. "
+                      "WinRate: %.1f%%. Elo Diff: %+.1f. New Arena Elo: %.1f",
+                      results['wins_b'], results['wins_a'], results['draws'], 
+                      results['win_rate_b']*100, elo_diff, current_elo)
                   
             # The current model is now the 'past' model for the next interval
             model_past.load_state_dict(model_current.state_dict())
@@ -366,11 +368,22 @@ def buffer_loop(config, buffer_queue, batch_queue, cmd_queue, res_queue, stop_ev
 
         last_games_update = 0
         last_reanalyze_push = 0
+        current_board_size = config.board_size
+        
         while not stop_event.is_set():
             for _ in range(50):
                 try:
                     game, step = buffer_queue.get_nowait()
-                    buffer.save_game(game, training_step=step)
+                    gbz = getattr(game, 'board_size', config.board_size)
+                    if gbz == current_board_size:
+                        try:
+                            buffer.save_game(game, training_step=step)
+                        except Exception as save_err:
+                            _log.error("[Buffer Process] save_game error: %s", save_err)
+                            import traceback
+                            traceback.print_exc()
+                    else:
+                        _log.warning("[Buffer Process] Discard game: game_size=%s, current_size=%s", gbz, current_board_size)
                 except queue.Empty:
                     break
             
@@ -405,7 +418,12 @@ def buffer_loop(config, buffer_queue, batch_queue, cmd_queue, res_queue, stop_ev
                         buffer.update_priorities(cmd['indices'], cmd['errors'])
                     elif cmd_type == 'clear':
                         buffer.clear()
+                        if 'board_size' in cmd:
+                            current_board_size = cmd['board_size']
                         res_queue.put({'type': 'clear_ok'})
+                    elif cmd_type == 'set_board_size':
+                        current_board_size = cmd['board_size']
+                        res_queue.put({'type': 'set_board_size_ok'})
                     elif cmd_type == 'load':
                         buffer.load(cmd['path'])
                         res_queue.put({'type': 'load_ok', 'num_games': buffer.num_games()})
@@ -802,16 +820,36 @@ def learner_loop(config, args, game_queue, weights_path, memory_path, stop_event
         # fp16 autocast caused NaN from intermediate overflow (loss ~10 * scale=256 in fp16)
         scaler = torch.amp.GradScaler('cuda', enabled=False)
 
-        # Learning rate scheduler: cosine annealing with linear warmup
+        # Track the step where the current curriculum stage started
+        _stage_start_step = [0]
+        
+        # Learning rate scheduler: cosine annealing with linear warmup (and warm restarts per curriculum stage)
         warmup_steps = 1000
-        def lr_lambda(current_step):
-            if current_step < warmup_steps:
-                # Linear warmup: 0 → 1 over warmup_steps
-                return max(0.01, current_step / warmup_steps)
+        def lr_lambda(_unused_epoch):
+            # PyTorch's LambdaLR passes an internal epoch counter that is lost if not explicitly saved.
+            # Instead, we dynamically read the true outer `step` variable via closure.
+            # Using nonlocal or a mutable cell (array) might be needed if `step` wasn't assigned yet,
+            # but since step is updated per iteration, we can just look it up.
+            current_step = shared_stats.total_steps.value
+            
+            stage_start = _stage_start_step[0]
+            steps_in_stage = current_step - stage_start
+            
+            # First stage goes up to 1.0; subsequent stages only warm restart up to 0.5 ratio
+            peak_ratio = 1.0 if stage_start == 0 else 0.5
+            
+            if steps_in_stage < warmup_steps:
+                # Linear warmup: 0.01 -> peak_ratio over warmup_steps
+                return 0.01 + (peak_ratio - 0.01) * (steps_in_stage / max(1, warmup_steps))
             else:
-                # Cosine annealing: 1 → min_lr_ratio over remaining steps
-                progress = (current_step - warmup_steps) / max(1, args.steps - warmup_steps)
-                return max(0.01, 0.5 * (1.0 + np.cos(np.pi * progress)))
+                # Cosine annealing: peak_ratio -> 0.01 over remaining global steps
+                remaining_steps_in_training = max(1, args.steps - stage_start - warmup_steps)
+                progress = (steps_in_stage - warmup_steps) / remaining_steps_in_training
+                progress = min(1.0, progress)
+                # Cosine from 1.0 to 0 over progress [0, 1]
+                cosine_factor = 0.5 * (1.0 + np.cos(np.pi * progress))
+                return 0.01 + (peak_ratio - 0.01) * cosine_factor
+                
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
         
         # Engram
@@ -1010,6 +1048,11 @@ def learner_loop(config, args, game_queue, weights_path, memory_path, stop_event
                 if league and isinstance(data, dict) and 'league_current_elo' in data:
                     league.current_elo = data['league_current_elo']
                     print(f"[Learner] League Restore: Elo {league.current_elo}")
+
+                if isinstance(data, dict):
+                    _stage_start_step[0] = data.get('curriculum_stage_start_step', 0)
+                    if _stage_start_step[0] > 0:
+                        print(f"[Learner] Stage Start Step Restore: {_stage_start_step[0]}")
 
                 print(f"[Learner] Resumed at Step {step}, Games {shared_stats.total_games.value}")
 
@@ -1290,6 +1333,12 @@ def learner_loop(config, args, game_queue, weights_path, memory_path, stop_event
                  
             if shared_curriculum_stage is not None:
                  shared_curriculum_stage.value = last_stage
+                 
+            # Ensure drainer strictly filters by the correct loaded curriculum board state
+            _drainer_expected_size[0] = curriculum.get_current_stage().board_size
+            
+            # Inform the background buffer_loop of the real expected board size
+            buffer_cmd_sync({'type': 'set_board_size', 'board_size': _drainer_expected_size[0]})
 
         # ── Background Game Drainer Thread ──────────────────────────
         # Continuously drains game_queue → buffer_queue, decoupling actor pace from learner step pace.
@@ -1319,7 +1368,7 @@ def learner_loop(config, args, game_queue, weights_path, memory_path, stop_event
                         board_size_discard_count[0] += 1
                         cnt = board_size_discard_count[0]
                         if cnt <= 5 or cnt % 50 == 0:
-                            print(f"[Learner] Discarded game: board_size={game.board_size} != expected {expected_size} (total discarded: {cnt})", flush=True)
+                            _log.warning("[Drainer] Discarded game: board_size=%d != expected %d (total: %d)", game.board_size, expected_size, cnt)
                         continue
 
                     # Score for curriculum: 1.0 win, 0.5 draw, 0.0 loss (for current/active agent)
@@ -1382,9 +1431,9 @@ def learner_loop(config, args, game_queue, weights_path, memory_path, stop_event
             if getattr(config, 'auto_curriculum', False):
                 # Ensure local var tracks manager
                 if curriculum.current_stage_idx > last_stage:
-                    print(f"[Learner] Curriculum Advancement: Stage {last_stage} -> {curriculum.current_stage_idx}", flush=True)
-                    print(f"[Learner] Clearing Replay Buffer to prevent stage mismatch...", flush=True)
-                    buffer_cmd_sync({'type': 'clear'})
+                    _log_learner.info("Curriculum Advancement: Stage %d -> %d", last_stage, curriculum.current_stage_idx)
+                    _log_learner.info("Clearing Replay Buffer to prevent stage mismatch...")
+                    buffer_cmd_sync({'type': 'clear', 'board_size': curriculum.get_current_stage().board_size})
                     last_stage = curriculum.current_stage_idx
 
             # Update expected board size for drainer thread
@@ -1430,7 +1479,7 @@ def learner_loop(config, args, game_queue, weights_path, memory_path, stop_event
                         es = _drainer_expected_size[0]
                         recv_hint += f" (discarded {board_size_discard_count[0]} games: board_size mismatch, expect {es}x{es})"
                     wait_hint = " (30x30 games ~1-2 min each; actors in progress)" if count == 0 and elapsed > 30 else ""
-                    print(f"[{current_time}] [Data Gen] Progress: {count}/{current_min} ({percent:.1f}%) | Speed: {speed_str} | ETA: {eta_str}{recv_hint}{wait_hint}", flush=True)
+                    _log_learner.info("[Data Gen] Progress: %d/%d (%.1f%%) | Speed: %s | ETA: %s%s%s", count, current_min, percent, speed_str, eta_str, recv_hint, wait_hint)
                 
                 stats = shared_stats.get_info()
                 broadcast('status', {
@@ -1739,9 +1788,14 @@ def learner_loop(config, args, game_queue, weights_path, memory_path, stop_event
                 if curriculum.check_graduation(step=step, league=league):
                     new_stage = curriculum.advance(league=league)
                     if new_stage:
+                        _stage_start_step[0] = step
                         if shared_curriculum_stage is not None:
                             # Actors index stages by 0-based index; store current_stage_idx not stage_id (1-4)
                             shared_curriculum_stage.value = curriculum.current_stage_idx
+                        
+                        # Tell background drainer to immediately reject old games
+                        _drainer_expected_size[0] = new_stage.board_size
+                        
                         broadcast('curriculum_graduation', {
                             'stage_id': new_stage.stage_id,
                             'stage': str(new_stage),
@@ -1749,7 +1803,7 @@ def learner_loop(config, args, game_queue, weights_path, memory_path, stop_event
                         _log_learner.info("GRADUATING to Stage %s: %s", new_stage.stage_id, new_stage)
                          
                         # 1. Clear Buffer (Mandatory due to shape change)
-                        buffer_cmd_sync({'type': 'clear'})
+                        buffer_cmd_sync({'type': 'clear', 'board_size': new_stage.board_size})
                         print("[Learner] Replay buffer cleared.", flush=True)
                         
                         # 2. Reset KOTH
@@ -1810,6 +1864,7 @@ def learner_loop(config, args, game_queue, weights_path, memory_path, stop_event
                     'global_step': step,  # Cross-compat alias
                     'stats': shared_stats.get_info(),
                     'curriculum_state': curriculum.state_dict(),
+                    'curriculum_stage_start_step': _stage_start_step[0],
                     'league_current_elo': league.current_elo,
                     'pbt_active_agent_idx': active_agent_idx if population else 0,
                     'pbt_step_counter': pbt_step_counter if population else 0,
